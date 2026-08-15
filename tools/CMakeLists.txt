@@ -37,6 +37,21 @@ target_link_libraries(audio-info
 )
 target_compile_options(audio-info PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
+add_executable(atmos-capability-probe
+        atmos_capability_probe.cpp
+        atmos_capability_probe_app.cpp
+        atmos_capability_probe_cli.cpp
+        atmos_capability_probe_policy.cpp
+        atmos_capability_probe_windows.cpp)
+target_link_libraries(atmos-capability-probe
+        nlohmann_json::nlohmann_json
+        ole32
+        windowsapp
+        ksuser
+        ${PLATFORM_LIBRARIES}
+)
+target_compile_options(atmos-capability-probe PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
 add_executable(sunshinesvc sunshinesvc.cpp)
 target_link_libraries(sunshinesvc
         ${CMAKE_THREAD_LIBS_INIT}
