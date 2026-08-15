@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 namespace {
+  using atmos_probe::api_error;
   using atmos_probe::display_audio_form_factor;
   using atmos_probe::endpoint_observation;
   using atmos_probe::hdmi_connector;
@@ -29,6 +30,7 @@ namespace {
   constexpr std::string_view k_exact_endpoint_id = "exact-id";
   constexpr std::string_view k_preflight_caveat =
     "Endpoint preflight does not prove downstream receiver Atmos lock.";
+  constexpr std::string_view k_ready_token = "ENDPOINT_PREFLIGHT_READY";
 
   probe_observation canonical_ready_observation() {
     probe_observation observation {};
@@ -217,9 +219,9 @@ TEST(AtmosCapabilityProbeApp, PassesExplicitIdToProviderAndSerializesCanonicalMa
   EXPECT_TRUE(validation.valid) << validation.error;
 }
 
-// Catches a validator that accepts an internally inconsistent green report after a prerequisite
-// was changed independently of the coordinator's canonical observations.
-TEST(AtmosCapabilityProbeApp, RejectsEveryMutatedGreenPrerequisite) {
+// Catches a validator that accepts a self-consistent hostile green report after a real endpoint
+// or MAT prerequisite is removed.
+TEST(AtmosCapabilityProbeApp, RejectsEverySelfConsistentMutatedGreenPrerequisite) {
   const std::array arguments {
     std::string_view {"--endpoint-id"},
     k_exact_endpoint_id,
@@ -236,37 +238,56 @@ TEST(AtmosCapabilityProbeApp, RejectsEveryMutatedGreenPrerequisite) {
   struct mutation_case {
     std::string_view name;
     void (*mutate)(ordered_json &);
+    std::string_view expected_error;
   };
-  const std::array<mutation_case, 10> mutations {
+  const std::array<mutation_case, 11> mutations {
     mutation_case {
       .name = "requested endpoint ID",
       .mutate = [](ordered_json &report) {
         report["selection"]["requested_endpoint_id"] = "wrong-requested-id";
       },
+      .expected_error = "an explicit request must match selected_endpoint.id",
     },
     mutation_case {
       .name = "selected endpoint ID",
       .mutate = [](ordered_json &report) {
         report["selected_endpoint"]["id"] = "wrong-selected-id";
       },
+      .expected_error = "an explicit request must match selected_endpoint.id",
     },
     mutation_case {
-      .name = "endpoint state",
+      .name = "state name mismatch",
+      .mutate = [](ordered_json &report) {
+        report["selected_endpoint"]["state_name"] = "UNKNOWN";
+      },
+      .expected_error = "selected_endpoint has an inconsistent state_name",
+    },
+    mutation_case {
+      .name = "inactive endpoint state and matching state name",
       .mutate = [](ordered_json &report) {
         report["selected_endpoint"]["state"] = 0;
+        report["selected_endpoint"]["state_name"] = "UNKNOWN";
       },
+      .expected_error = "a green report requires an active endpoint",
     },
     mutation_case {
-      .name = "display form factor",
+      .name = "full other form factor and derived presentation",
       .mutate = [](ordered_json &report) {
-        report["selected_endpoint"]["form_factor"]["status"] = "OTHER";
+        report["selected_endpoint"]["form_factor"] = {
+          {"status", "OTHER"},
+          {"value", 7},
+        };
+        report["selected_endpoint"]["is_display_audio"] = false;
       },
+      .expected_error = "a green report requires DISPLAY_AUDIO",
     },
     mutation_case {
-      .name = "HDMI connector",
+      .name = "DisplayPort connector and derived presentation",
       .mutate = [](ordered_json &report) {
         report["selected_endpoint"]["jack_subtype"]["status"] = "DISPLAYPORT";
+        report["selected_endpoint"]["is_hdmi"] = false;
       },
+      .expected_error = "a green report requires HDMI",
     },
     mutation_case {
       .name = "active Atmos GUID",
@@ -274,30 +295,53 @@ TEST(AtmosCapabilityProbeApp, RejectsEveryMutatedGreenPrerequisite) {
         report["spatial_audio"]["active_format_guid"] =
           "{00000000-0000-0000-0000-000000000001}";
       },
+      .expected_error = "a green report requires the exact active Atmos Home Theater state",
     },
     mutation_case {
-      .name = "selected profile ready membership",
+      .name = "self-consistent missing ready-profile membership",
       .mutate = [](ordered_json &report) {
-        report["gate"]["ready_profiles"] = ordered_json::array({"MAT20"});
+        for (auto &profile : report["mat_profiles"]) {
+          profile["format_support_hresult"] = nullptr;
+          profile["format_support_hresult_label"] = "NOT_PROBED";
+          profile["ready"] = false;
+        }
+        report["gate"]["ready_profiles"] = ordered_json::array();
+        report["gate"]["selected_profile"] = nullptr;
       },
+      .expected_error = "a green report requires selected profile ready membership",
     },
     mutation_case {
-      .name = "MAT format support HRESULT",
+      .name = "self-consistent MAT format support HRESULT",
       .mutate = [](ordered_json &report) {
-        report["mat_profiles"][0]["format_support_hresult"] = "0x8889000A";
+        for (auto &profile : report["mat_profiles"]) {
+          profile["format_support_hresult"] = "0x8889000A";
+          profile["format_support_hresult_label"] = "AUDCLNT_E_DEVICE_IN_USE";
+          profile["ready"] = false;
+        }
+        report["gate"]["ready_profiles"] = ordered_json::array();
+        report["gate"]["selected_profile"] = nullptr;
       },
+      .expected_error = "a green report requires selected profile ready membership",
     },
     mutation_case {
-      .name = "MAT initialize HRESULT",
+      .name = "self-consistent MAT initialize HRESULT",
       .mutate = [](ordered_json &report) {
-        report["mat_profiles"][0]["initialize_hresult"] = "0x8889000A";
+        for (auto &profile : report["mat_profiles"]) {
+          profile["initialize_hresult"] = "0x8889000A";
+          profile["initialize_hresult_label"] = "AUDCLNT_E_DEVICE_IN_USE";
+          profile["ready"] = false;
+        }
+        report["gate"]["ready_profiles"] = ordered_json::array();
+        report["gate"]["selected_profile"] = nullptr;
       },
+      .expected_error = "a green report requires selected profile ready membership",
     },
     mutation_case {
       .name = "audio bytes written",
       .mutate = [](ordered_json &report) {
         report["audio_bytes_written"] = true;
       },
+      .expected_error = "audio_bytes_written must be false",
     },
   };
 
@@ -305,6 +349,112 @@ TEST(AtmosCapabilityProbeApp, RejectsEveryMutatedGreenPrerequisite) {
     SCOPED_TRACE(std::string {mutation.name});
     auto mutated = canonical_report;
     mutation.mutate(mutated);
+
+    const auto validation = atmos_probe::validate_serialized_report(mutated.dump());
+    EXPECT_FALSE(validation.valid);
+    EXPECT_EQ(validation.error, mutation.expected_error);
+  }
+}
+
+// Catches malformed, non-object, null, array, and otherwise well-formed but wrong-typed JSON
+// reports that would bypass report validation before invariant evaluation.
+TEST(AtmosCapabilityProbeApp, RejectsMalformedNonObjectNullArrayAndWrongTypeReports) {
+  const std::array<std::string_view, 4> non_reports {
+    "{",
+    "\"not-an-object\"",
+    "null",
+    "[]",
+  };
+  for (const auto json : non_reports) {
+    SCOPED_TRACE(std::string {json});
+    const auto validation = atmos_probe::validate_serialized_report(json);
+    EXPECT_FALSE(validation.valid);
+    EXPECT_FALSE(validation.error.empty());
+  }
+
+  const std::array arguments {std::string_view {"--json"}};
+  const auto result = atmos_probe::run_probe(
+    arguments,
+    [](const probe_options &) {
+      return canonical_ready_observation();
+    });
+  ASSERT_EQ(result.exit_code, 0) << result.standard_error;
+  auto wrong_type = parse_report(result.standard_output);
+  wrong_type["schema_version"] = "1";
+
+  const auto validation = atmos_probe::validate_serialized_report(wrong_type.dump());
+  EXPECT_FALSE(validation.valid);
+  EXPECT_FALSE(validation.error.empty());
+}
+
+// Catches schema acceptance of an omitted or duplicated MAT profile in an otherwise canonical
+// report.
+TEST(AtmosCapabilityProbeApp, RejectsMissingAndDuplicateMatProfiles) {
+  const std::array arguments {std::string_view {"--json"}};
+  const auto result = atmos_probe::run_probe(
+    arguments,
+    [](const probe_options &) {
+      return canonical_ready_observation();
+    });
+  ASSERT_EQ(result.exit_code, 0) << result.standard_error;
+  const auto canonical_report = parse_report(result.standard_output);
+
+  auto missing_profile = canonical_report;
+  missing_profile["mat_profiles"] = ordered_json::array({canonical_report["mat_profiles"].at(0)});
+  const auto missing_validation =
+    atmos_probe::validate_serialized_report(missing_profile.dump());
+  EXPECT_FALSE(missing_validation.valid);
+  EXPECT_FALSE(missing_validation.error.empty());
+
+  auto duplicate_profile = canonical_report;
+  duplicate_profile["mat_profiles"].at(1) = duplicate_profile["mat_profiles"].at(0);
+  const auto duplicate_validation =
+    atmos_probe::validate_serialized_report(duplicate_profile.dump());
+  EXPECT_FALSE(duplicate_validation.valid);
+  EXPECT_FALSE(duplicate_validation.error.empty());
+}
+
+// Catches HResult labels that contradict either a S_OK value or a not-probed value.
+TEST(AtmosCapabilityProbeApp, RejectsMisleadingHresultLabels) {
+  const std::array arguments {std::string_view {"--json"}};
+  const auto result = atmos_probe::run_probe(
+    arguments,
+    [](const probe_options &) {
+      return canonical_ready_observation();
+    });
+  ASSERT_EQ(result.exit_code, 0) << result.standard_error;
+  const auto canonical_report = parse_report(result.standard_output);
+
+  struct label_case {
+    std::string_view name;
+    void (*mutate)(ordered_json &);
+  };
+  const std::array<label_case, 3> cases {
+    label_case {
+      .name = "S_OK format support with device-in-use label",
+      .mutate = [](ordered_json &report) {
+        report["mat_profiles"].at(0)["format_support_hresult_label"] =
+          "AUDCLNT_E_DEVICE_IN_USE";
+      },
+    },
+    label_case {
+      .name = "S_OK initialization with unknown label",
+      .mutate = [](ordered_json &report) {
+        report["mat_profiles"].at(0)["initialize_hresult_label"] = "UNKNOWN_HRESULT";
+      },
+    },
+    label_case {
+      .name = "not-probed support with S_OK label",
+      .mutate = [](ordered_json &report) {
+        report["mat_profiles"].at(0)["format_support_hresult"] = nullptr;
+        report["mat_profiles"].at(0)["format_support_hresult_label"] = "S_OK";
+      },
+    },
+  };
+  for (const auto &test_case : cases) {
+    SCOPED_TRACE(std::string {test_case.name});
+    auto mutated = canonical_report;
+    test_case.mutate(mutated);
 
     const auto validation = atmos_probe::validate_serialized_report(mutated.dump());
     EXPECT_FALSE(validation.valid);
@@ -329,8 +479,9 @@ TEST(AtmosCapabilityProbeApp, TurnsExplicitSelectionMismatchIntoRuntimeFailureWi
     });
 
   EXPECT_EQ(result.exit_code, 3);
-  EXPECT_EQ(result.standard_output.find("ENDPOINT_PREFLIGHT_READY"), std::string::npos);
-  EXPECT_FALSE(result.standard_error.empty());
+  EXPECT_EQ(result.standard_output.find(k_ready_token), std::string::npos);
+  EXPECT_EQ(result.standard_error.find(k_ready_token), std::string::npos);
+  EXPECT_EQ(result.standard_error, "report validation failure\n");
 }
 
 // Catches an exit mapper that treats a policy-blocked endpoint as a successful process result or
@@ -352,6 +503,53 @@ TEST(AtmosCapabilityProbeApp, MapsCanonicalBlockedObservationToExitOneAndHumanBl
   EXPECT_TRUE(result.standard_output.starts_with("BLOCKED\n"));
   EXPECT_TRUE(result.standard_output.contains(k_preflight_caveat));
   EXPECT_TRUE(result.standard_error.empty());
+}
+
+// Catches a returned incomplete observation being treated like an ordinary capability block even
+// though it carries the policy's explicit runtime diagnostic.
+TEST(AtmosCapabilityProbeApp, MapsIncompleteProviderObservationToExitThreeWithDiagnosticJson) {
+  const std::array arguments {std::string_view {"--json"}};
+  const auto result = atmos_probe::run_probe(
+    arguments,
+    [](const probe_options &) {
+      auto observation = canonical_ready_observation();
+      observation.probe_complete = false;
+      return observation;
+    });
+
+  ASSERT_EQ(result.exit_code, 3) << result.standard_error;
+  const auto report = parse_report(result.standard_output);
+  EXPECT_EQ(report.at("gate").at("verdict").get<std::string>(), "BLOCKED");
+  ASSERT_EQ(report.at("gate").at("diagnostics").size(), 1U);
+  EXPECT_EQ(report.at("gate").at("diagnostics").at(0).get<std::string>(), "PROBE_RUNTIME_ERROR");
+  const auto validation = atmos_probe::validate_serialized_report(result.standard_output);
+  EXPECT_TRUE(validation.valid) << validation.error;
+}
+
+// Catches a returned API-error observation being treated like an ordinary capability block instead
+// of returning the report and the dedicated runtime exit code.
+TEST(AtmosCapabilityProbeApp, MapsProviderErrorObservationToExitThreeWithDiagnosticJson) {
+  const std::array arguments {std::string_view {"--json"}};
+  const auto result = atmos_probe::run_probe(
+    arguments,
+    [](const probe_options &) {
+      auto observation = canonical_ready_observation();
+      observation.errors.push_back(api_error {
+        .operation = "collector failure",
+        .hresult = static_cast<hresult_code>(0x80004005U),
+      });
+      return observation;
+    });
+
+  ASSERT_EQ(result.exit_code, 3) << result.standard_error;
+  const auto report = parse_report(result.standard_output);
+  EXPECT_EQ(report.at("gate").at("verdict").get<std::string>(), "BLOCKED");
+  ASSERT_EQ(report.at("gate").at("diagnostics").size(), 1U);
+  EXPECT_EQ(report.at("gate").at("diagnostics").at(0).get<std::string>(), "PROBE_RUNTIME_ERROR");
+  ASSERT_EQ(report.at("probe_errors").size(), 1U);
+  EXPECT_EQ(report.at("probe_errors").at(0).at("operation").get<std::string>(), "collector failure");
+  const auto validation = atmos_probe::validate_serialized_report(result.standard_output);
+  EXPECT_TRUE(validation.valid) << validation.error;
 }
 
 // Catches JSON null construction that would turn a normal missing-endpoint, unprobed observation
@@ -405,13 +603,14 @@ TEST(AtmosCapabilityProbeApp, MapsThrowingProviderToExitThreeWithoutGreenOutput)
     arguments,
     [&provider_calls](const probe_options &) -> probe_observation {
       ++provider_calls;
-      throw std::runtime_error {"provider exploded"};
+      throw std::runtime_error {"provider ENDPOINT_PREFLIGHT_READY exploded"};
     });
 
   EXPECT_EQ(provider_calls, 1);
   EXPECT_EQ(result.exit_code, 3);
-  EXPECT_EQ(result.standard_output.find("ENDPOINT_PREFLIGHT_READY"), std::string::npos);
-  EXPECT_TRUE(result.standard_error.contains("provider exploded"));
+  EXPECT_EQ(result.standard_output.find(k_ready_token), std::string::npos);
+  EXPECT_EQ(result.standard_error.find(k_ready_token), std::string::npos);
+  EXPECT_EQ(result.standard_error, "provider/runtime failure\n");
 }
 
 // Catches a JSON serialization exception that would otherwise escape the coordinator instead of
@@ -424,13 +623,15 @@ TEST(AtmosCapabilityProbeApp, MapsReportSerializationFailureToExitThreeWithoutGr
     arguments,
     [](const probe_options &) {
       auto observation = canonical_ready_observation();
-      observation.selected_endpoint->id = std::string {"\xFF", 1};
+      observation.selected_endpoint->id =
+        std::string {k_ready_token} + std::string(1, static_cast<char>(0xFF));
       return observation;
     }));
 
   EXPECT_EQ(result.exit_code, 3);
-  EXPECT_EQ(result.standard_output.find("ENDPOINT_PREFLIGHT_READY"), std::string::npos);
-  EXPECT_TRUE(result.standard_error.contains("report/runtime failure"));
+  EXPECT_EQ(result.standard_output.find(k_ready_token), std::string::npos);
+  EXPECT_EQ(result.standard_error.find(k_ready_token), std::string::npos);
+  EXPECT_EQ(result.standard_error, "report/runtime failure\n");
 }
 
 // Catches a help implementation that initializes Windows probing instead of returning immediately.

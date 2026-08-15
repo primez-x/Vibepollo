@@ -937,15 +937,15 @@ namespace atmos_probe {
     try {
       options.endpoint_id = parsed.options->endpoint_id;
       observation = provider(options);
-    } catch (const std::exception &error) {
+    } catch (const std::exception &) {
       return {
         .exit_code = 3,
-        .standard_error = "provider/runtime failure: " + std::string {error.what()} + "\n",
+        .standard_error = "provider/runtime failure\n",
       };
     } catch (...) {
       return {
         .exit_code = 3,
-        .standard_error = "provider/runtime failure: unknown exception\n",
+        .standard_error = "provider/runtime failure\n",
       };
     }
 
@@ -958,22 +958,23 @@ namespace atmos_probe {
       if (!validation.valid) {
         return {
           .exit_code = 3,
-          .standard_error = "report validation failure: " + validation.error + "\n",
+          .standard_error = "report validation failure\n",
         };
       }
-    } catch (const std::exception &error) {
+    } catch (const std::exception &) {
       return {
         .exit_code = 3,
-        .standard_error = "report/runtime failure: " + std::string {error.what()} + "\n",
+        .standard_error = "report/runtime failure\n",
       };
     } catch (...) {
       return {
         .exit_code = 3,
-        .standard_error = "report/runtime failure: unknown exception\n",
+        .standard_error = "report/runtime failure\n",
       };
     }
 
-    const auto exit_code = gate.ready ? 0 : 1;
+    const auto exit_code = !observation.probe_complete || !observation.errors.empty() ?
+      3 : gate.ready ? 0 : 1;
     if (parsed.options->json) {
       return {
         .exit_code = exit_code,
