@@ -11,7 +11,7 @@
 namespace atmos_probe {
   using hresult_code = std::int32_t;
 
-  enum class mat_profile { mat20, mat21 };
+  enum class mat_profile { mat10, mat20, mat21 };
 
   struct probe_options {
     std::optional<std::string> endpoint_id;
@@ -23,10 +23,14 @@ namespace atmos_probe {
     selected_endpoint_not_active,
     selected_endpoint_not_display_audio,
     selected_endpoint_not_hdmi,
+    spatial_device_id_unlinked,
     spatial_configuration_unavailable,
     spatial_audio_unsupported,
     atmos_home_theater_unsupported,
     active_spatial_format_not_atmos_home_theater,
+    mat10_exclusive_probe_failed,
+    mat10_exclusive_format_unsupported,
+    mat10_exclusive_initialize_failed,
     mat20_exclusive_probe_failed,
     mat20_exclusive_format_unsupported,
     mat20_exclusive_initialize_failed,
@@ -80,6 +84,10 @@ namespace atmos_probe {
   };
 
   struct spatial_observation {
+    bool selected_endpoint_linked {};
+    std::string link_source;
+    std::string input_render_device_id;
+    std::string returned_render_device_id;
     bool configuration_available {};
     bool spatial_audio_supported {};
     bool atmos_home_theater_supported {};
@@ -107,6 +115,7 @@ namespace atmos_probe {
     spatial_observation spatial;
     mat_observation mat21;
     mat_observation mat20;
+    mat_observation mat10;
     std::vector<api_error> errors;
   };
 
@@ -121,6 +130,17 @@ namespace atmos_probe {
   bool is_active(const endpoint_observation &endpoint);
   bool is_display_audio(const endpoint_observation &endpoint);
   bool is_hdmi(const endpoint_observation &endpoint);
+  bool all_default_roles_match_selected_endpoint(
+    const std::optional<endpoint_observation> &selected_endpoint,
+    const std::array<role_endpoint_observation, 3> &default_endpoints);
+  bool default_route_link_is_stable(
+    const std::optional<endpoint_observation> &selected_endpoint,
+    const std::array<role_endpoint_observation, 3> &initial_default_endpoints,
+    const std::array<role_endpoint_observation, 3> &final_default_endpoints,
+    std::string_view initial_default_render_id,
+    std::string_view initial_communications_render_id,
+    std::string_view final_default_render_id,
+    std::string_view final_communications_render_id);
   std::string_view to_string(mat_profile profile);
   std::string_view to_string(diagnostic value);
 }  // namespace atmos_probe

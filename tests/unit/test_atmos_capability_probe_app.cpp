@@ -29,7 +29,7 @@ namespace {
     "{A289735D-FA3E-4E35-9D7D-B6F896ACB2E7}";
   constexpr std::string_view k_exact_endpoint_id = "exact-id";
   constexpr std::string_view k_preflight_caveat =
-    "Endpoint preflight does not prove downstream receiver Atmos lock.";
+    "Endpoint preflight does not prove source-profile emission or downstream receiver Atmos lock.";
   constexpr std::string_view k_ready_token = "ENDPOINT_PREFLIGHT_READY";
 
   probe_observation canonical_ready_observation() {
@@ -49,6 +49,10 @@ namespace {
     };
     observation.active_endpoints = {endpoint};
     observation.spatial = {
+      .selected_endpoint_linked = true,
+      .link_source = "winrt_default_and_communications",
+      .input_render_device_id = "opaque-winrt-render-id",
+      .returned_render_device_id = "opaque-winrt-render-id",
       .configuration_available = true,
       .spatial_audio_supported = true,
       .atmos_home_theater_supported = true,
@@ -62,6 +66,10 @@ namespace {
       .initialize_hresult = 0,
     };
     observation.mat20 = {
+      .format_support_hresult = 0,
+      .initialize_hresult = 0,
+    };
+    observation.mat10 = {
       .format_support_hresult = 0,
       .initialize_hresult = 0,
     };
@@ -104,14 +112,12 @@ namespace {
   }
 }  // namespace
 
-// Catches an app coordinator that alters an explicit endpoint ID, delegates selection text to the
-// provider, emits a non-canonical green report, or reorders the public JSON contract.
-TEST(AtmosCapabilityProbeApp, PassesExplicitIdToProviderAndSerializesCanonicalMat21ReadyReport) {
+// Catches an app coordinator that emits a non-canonical default green report or reorders the public
+// JSON contract.
+TEST(AtmosCapabilityProbeApp, SerializesCanonicalDefaultMat21ReadyReport) {
   std::optional<probe_options> captured_options;
   int provider_calls {};
   const std::array arguments {
-    std::string_view {"--endpoint-id"},
-    k_exact_endpoint_id,
     std::string_view {"--json"},
   };
 
@@ -125,8 +131,7 @@ TEST(AtmosCapabilityProbeApp, PassesExplicitIdToProviderAndSerializesCanonicalMa
 
   ASSERT_EQ(provider_calls, 1);
   ASSERT_TRUE(captured_options.has_value());
-  ASSERT_TRUE(captured_options->endpoint_id.has_value());
-  EXPECT_EQ(*captured_options->endpoint_id, k_exact_endpoint_id);
+  EXPECT_FALSE(captured_options->endpoint_id.has_value());
   ASSERT_EQ(result.exit_code, 0) << result.standard_error;
   EXPECT_TRUE(result.standard_error.contains(k_preflight_caveat));
 
@@ -153,6 +158,10 @@ TEST(AtmosCapabilityProbeApp, PassesExplicitIdToProviderAndSerializesCanonicalMa
     report.at("spatial_audio"),
     {
       "configuration_available",
+      "selected_endpoint_linked",
+      "link_source",
+      "input_render_device_id",
+      "returned_render_device_id",
       "is_spatial_audio_supported",
       "atmos_home_theater_supported",
       "active_format_raw",
@@ -164,11 +173,9 @@ TEST(AtmosCapabilityProbeApp, PassesExplicitIdToProviderAndSerializesCanonicalMa
     report.at("gate"),
     {"verdict", "selected_profile", "ready_profiles", "diagnostics"});
 
-  EXPECT_EQ(report.at("schema_version").get<int>(), 1);
-  EXPECT_EQ(report.at("selection").at("kind").get<std::string>(), "explicit");
-  EXPECT_EQ(
-    report.at("selection").at("requested_endpoint_id").get<std::string>(),
-    k_exact_endpoint_id);
+  EXPECT_EQ(report.at("schema_version").get<int>(), 2);
+  EXPECT_EQ(report.at("selection").at("kind").get<std::string>(), "default:eConsole");
+  EXPECT_TRUE(report.at("selection").at("requested_endpoint_id").is_null());
   ASSERT_TRUE(report.at("selected_endpoint").is_object());
   expect_object_keys(
     report.at("selected_endpoint"),
@@ -200,6 +207,19 @@ TEST(AtmosCapabilityProbeApp, PassesExplicitIdToProviderAndSerializesCanonicalMa
   EXPECT_EQ(
     report.at("gate").at("ready_profiles").at(0).get<std::string>(),
     "MAT21");
+  ASSERT_EQ(report.at("gate").at("ready_profiles").size(), 3U);
+  EXPECT_EQ(report.at("gate").at("ready_profiles").at(1).get<std::string>(), "MAT20");
+  EXPECT_EQ(report.at("gate").at("ready_profiles").at(2).get<std::string>(), "MAT10");
+  EXPECT_TRUE(report.at("spatial_audio").at("selected_endpoint_linked").get<bool>());
+  EXPECT_EQ(
+    report.at("spatial_audio").at("link_source").get<std::string>(),
+    "winrt_default_and_communications");
+  EXPECT_EQ(
+    report.at("spatial_audio").at("input_render_device_id").get<std::string>(),
+    "opaque-winrt-render-id");
+  EXPECT_EQ(
+    report.at("spatial_audio").at("returned_render_device_id").get<std::string>(),
+    "opaque-winrt-render-id");
   EXPECT_EQ(
     report.at("spatial_audio").at("active_format_guid").get<std::string>(),
     k_atmos_home_theater_guid);
@@ -215,6 +235,91 @@ TEST(AtmosCapabilityProbeApp, PassesExplicitIdToProviderAndSerializesCanonicalMa
   EXPECT_EQ(mat21->at("initialize_hresult_label").get<std::string>(), "S_OK");
   EXPECT_TRUE(mat21->at("ready").get<bool>());
 
+  ASSERT_EQ(report.at("mat_profiles").size(), 3U);
+  EXPECT_EQ(report.at("mat_profiles").at(0).at("profile").get<std::string>(), "MAT21");
+  EXPECT_EQ(report.at("mat_profiles").at(1).at("profile").get<std::string>(), "MAT20");
+  EXPECT_EQ(report.at("mat_profiles").at(2).at("profile").get<std::string>(), "MAT10");
+
+  const auto validation = atmos_probe::validate_serialized_report(result.standard_output);
+  EXPECT_TRUE(validation.valid) << validation.error;
+}
+
+// Catches loss or alteration of an explicit opaque Core Audio endpoint ID while preserving the
+// fail-closed spatial-link boundary for diagnostic endpoint inspection.
+TEST(AtmosCapabilityProbeApp, PreservesExplicitIdForBlockedCoreAudioInspection) {
+  std::optional<probe_options> captured_options;
+  const std::array arguments {
+    std::string_view {"--endpoint-id"},
+    k_exact_endpoint_id,
+    std::string_view {"--json"},
+  };
+  const auto result = atmos_probe::run_probe(
+    arguments,
+    [&captured_options](const probe_options &options) {
+      captured_options = options;
+      auto observation = canonical_ready_observation();
+      observation.spatial = {};
+      return observation;
+    });
+
+  ASSERT_TRUE(captured_options.has_value());
+  ASSERT_TRUE(captured_options->endpoint_id.has_value());
+  EXPECT_EQ(*captured_options->endpoint_id, k_exact_endpoint_id);
+  ASSERT_EQ(result.exit_code, 1) << result.standard_error;
+  const auto report = parse_report(result.standard_output);
+  EXPECT_EQ(report.at("selection").at("kind").get<std::string>(), "explicit");
+  EXPECT_EQ(
+    report.at("selection").at("requested_endpoint_id").get<std::string>(),
+    k_exact_endpoint_id);
+  EXPECT_EQ(
+    report.at("selected_endpoint").at("id").get<std::string>(),
+    k_exact_endpoint_id);
+  EXPECT_EQ(report.at("gate").at("verdict").get<std::string>(), "BLOCKED");
+  EXPECT_EQ(
+    report.at("gate").at("diagnostics").at(0).get<std::string>(),
+    "SPATIAL_DEVICE_ID_UNLINKED");
+}
+
+// Catches a hostile provider that synthesizes linked WinRT fields to turn an explicit endpoint
+// selection into READY without a documented API linkage for that exact endpoint.
+TEST(AtmosCapabilityProbeApp, RejectsSyntheticExplicitLinkedReadyReport) {
+  const std::array arguments {
+    std::string_view {"--endpoint-id"},
+    k_exact_endpoint_id,
+    std::string_view {"--json"},
+  };
+  const auto result = atmos_probe::run_probe(
+    arguments,
+    [](const probe_options &) {
+      return canonical_ready_observation();
+    });
+
+  EXPECT_EQ(result.exit_code, 3);
+  EXPECT_TRUE(result.standard_output.empty());
+  EXPECT_EQ(result.standard_error, "report validation failure\n");
+}
+
+// Catches a coordinator or validator that omits an independently ready MAT10 profile or refuses
+// to select it when MAT21 and MAT20 are unavailable.
+TEST(AtmosCapabilityProbeApp, SerializesMat10OnlyReadyReport) {
+  const std::array arguments {std::string_view {"--json"}};
+  const auto result = atmos_probe::run_probe(
+    arguments,
+    [](const probe_options &) {
+      auto observation = canonical_ready_observation();
+      observation.mat21 = {};
+      observation.mat20 = {};
+      return observation;
+    });
+
+  ASSERT_EQ(result.exit_code, 0) << result.standard_error;
+  const auto report = parse_report(result.standard_output);
+  EXPECT_EQ(report.at("gate").at("selected_profile").get<std::string>(), "MAT10");
+  ASSERT_EQ(report.at("gate").at("ready_profiles").size(), 1U);
+  EXPECT_EQ(report.at("gate").at("ready_profiles").at(0).get<std::string>(), "MAT10");
+  const auto *mat10 = find_profile(report.at("mat_profiles"), "MAT10");
+  ASSERT_NE(mat10, nullptr);
+  EXPECT_TRUE(mat10->at("ready").get<bool>());
   const auto validation = atmos_probe::validate_serialized_report(result.standard_output);
   EXPECT_TRUE(validation.valid) << validation.error;
 }
@@ -223,8 +328,6 @@ TEST(AtmosCapabilityProbeApp, PassesExplicitIdToProviderAndSerializesCanonicalMa
 // or MAT prerequisite is removed.
 TEST(AtmosCapabilityProbeApp, RejectsEverySelfConsistentMutatedGreenPrerequisite) {
   const std::array arguments {
-    std::string_view {"--endpoint-id"},
-    k_exact_endpoint_id,
     std::string_view {"--json"},
   };
   const auto result = atmos_probe::run_probe(
@@ -240,20 +343,30 @@ TEST(AtmosCapabilityProbeApp, RejectsEverySelfConsistentMutatedGreenPrerequisite
     void (*mutate)(ordered_json &);
     std::string_view expected_error;
   };
-  const std::array<mutation_case, 11> mutations {
+  const std::array<mutation_case, 16> mutations {
     mutation_case {
       .name = "requested endpoint ID",
       .mutate = [](ordered_json &report) {
         report["selection"]["requested_endpoint_id"] = "wrong-requested-id";
       },
-      .expected_error = "an explicit request must match selected_endpoint.id",
+      .expected_error = "default selection must not include a requested endpoint ID",
     },
     mutation_case {
       .name = "selected endpoint ID",
       .mutate = [](ordered_json &report) {
         report["selected_endpoint"]["id"] = "wrong-selected-id";
       },
-      .expected_error = "an explicit request must match selected_endpoint.id",
+      .expected_error = "a green report requires all default roles to match selected_endpoint.id",
+    },
+    mutation_case {
+      .name = "self-consistent empty endpoint IDs",
+      .mutate = [](ordered_json &report) {
+        report["selected_endpoint"]["id"] = "";
+        report["default_render_endpoints"]["console"]["id"] = "";
+        report["default_render_endpoints"]["multimedia"]["id"] = "";
+        report["default_render_endpoints"]["communications"]["id"] = "";
+      },
+      .expected_error = "a green report requires a nonempty selected endpoint ID",
     },
     mutation_case {
       .name = "state name mismatch",
@@ -296,6 +409,39 @@ TEST(AtmosCapabilityProbeApp, RejectsEverySelfConsistentMutatedGreenPrerequisite
           "{00000000-0000-0000-0000-000000000001}";
       },
       .expected_error = "a green report requires the exact active Atmos Home Theater state",
+    },
+    mutation_case {
+      .name = "self-consistent unlinked spatial endpoint",
+      .mutate = [](ordered_json &report) {
+        report["spatial_audio"]["selected_endpoint_linked"] = false;
+        report["spatial_audio"]["link_source"] = "";
+        report["spatial_audio"]["input_render_device_id"] = "";
+        report["spatial_audio"]["returned_render_device_id"] = "";
+        report["spatial_audio"]["configuration_available"] = false;
+        report["gate"]["verdict"] = "ENDPOINT_PREFLIGHT_READY";
+      },
+      .expected_error = "a green report requires an exact linked spatial DeviceId",
+    },
+    mutation_case {
+      .name = "wrong spatial link source",
+      .mutate = [](ordered_json &report) {
+        report["spatial_audio"]["link_source"] = "friendly_name_inference";
+      },
+      .expected_error = "spatial_audio.link_source is invalid",
+    },
+    mutation_case {
+      .name = "empty spatial input DeviceId",
+      .mutate = [](ordered_json &report) {
+        report["spatial_audio"]["input_render_device_id"] = "";
+      },
+      .expected_error = "a linked spatial endpoint requires a nonempty input_render_device_id",
+    },
+    mutation_case {
+      .name = "returned spatial DeviceId mismatch",
+      .mutate = [](ordered_json &report) {
+        report["spatial_audio"]["returned_render_device_id"] = "different-winrt-id";
+      },
+      .expected_error = "a green report requires an exact linked spatial DeviceId",
     },
     mutation_case {
       .name = "self-consistent missing ready-profile membership",
@@ -380,11 +526,18 @@ TEST(AtmosCapabilityProbeApp, RejectsMalformedNonObjectNullArrayAndWrongTypeRepo
     });
   ASSERT_EQ(result.exit_code, 0) << result.standard_error;
   auto wrong_type = parse_report(result.standard_output);
-  wrong_type["schema_version"] = "1";
+  wrong_type["schema_version"] = "2";
 
   const auto validation = atmos_probe::validate_serialized_report(wrong_type.dump());
   EXPECT_FALSE(validation.valid);
   EXPECT_FALSE(validation.error.empty());
+
+  auto old_schema = parse_report(result.standard_output);
+  old_schema["schema_version"] = 1;
+  const auto old_schema_validation =
+    atmos_probe::validate_serialized_report(old_schema.dump());
+  EXPECT_FALSE(old_schema_validation.valid);
+  EXPECT_FALSE(old_schema_validation.error.empty());
 }
 
 // Catches schema acceptance of an omitted or duplicated MAT profile in an otherwise canonical
@@ -412,6 +565,19 @@ TEST(AtmosCapabilityProbeApp, RejectsMissingAndDuplicateMatProfiles) {
     atmos_probe::validate_serialized_report(duplicate_profile.dump());
   EXPECT_FALSE(duplicate_validation.valid);
   EXPECT_FALSE(duplicate_validation.error.empty());
+
+  auto reordered_profiles = canonical_report;
+  std::swap(reordered_profiles["mat_profiles"].at(1), reordered_profiles["mat_profiles"].at(2));
+  const auto reordered_validation =
+    atmos_probe::validate_serialized_report(reordered_profiles.dump());
+  EXPECT_FALSE(reordered_validation.valid);
+  EXPECT_FALSE(reordered_validation.error.empty());
+
+  auto extra_profile = canonical_report;
+  extra_profile["mat_profiles"].push_back(canonical_report["mat_profiles"].at(2));
+  const auto extra_validation = atmos_probe::validate_serialized_report(extra_profile.dump());
+  EXPECT_FALSE(extra_validation.valid);
+  EXPECT_FALSE(extra_validation.error.empty());
 }
 
 // Catches HResult labels that contradict either a S_OK value or a not-probed value.

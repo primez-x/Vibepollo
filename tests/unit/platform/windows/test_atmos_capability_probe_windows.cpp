@@ -58,6 +58,12 @@ namespace {
 
 static_assert(sizeof(WAVEFORMATEXTENSIBLE_IEC61937) == 52);
 
+// Catches MAT10 descriptor drift or inference from a newer Dolby MAT subtype.
+TEST(AtmosCapabilityProbeWindows, BuildsExactMat10Descriptor) {
+  const auto format = atmos_probe::make_mat_format(atmos_probe::mat_profile::mat10);
+  expect_exact_mat_fields(format, atmos_probe::k_iec61937_dolby_mlp);
+}
+
 // Catches descriptor drift that would make an exact MAT21 WASAPI probe test a different format.
 TEST(AtmosCapabilityProbeWindows, BuildsExactMat21Descriptor) {
   const auto format = atmos_probe::make_mat_format(atmos_probe::mat_profile::mat21);

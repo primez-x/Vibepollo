@@ -35,8 +35,10 @@ namespace {
 
   constexpr std::string_view k_atmos_home_theater_guid =
     "{A289735D-FA3E-4E35-9D7D-B6F896ACB2E7}";
+  constexpr std::string_view k_winrt_default_link_source =
+    "winrt_default_and_communications";
   constexpr std::string_view k_preflight_caveat =
-    "Endpoint preflight does not prove downstream receiver Atmos lock.";
+    "Endpoint preflight does not prove source-profile emission or downstream receiver Atmos lock.";
   constexpr std::uint32_t k_s_ok = 0x00000000U;
   constexpr std::uint32_t k_audclnt_e_device_invalidated = 0x88890004U;
   constexpr std::uint32_t k_audclnt_e_unsupported_format = 0x88890008U;
@@ -208,6 +210,10 @@ namespace {
     const auto &spatial = observation.spatial;
     return {
       {"configuration_available", spatial.configuration_available},
+      {"selected_endpoint_linked", spatial.selected_endpoint_linked},
+      {"link_source", spatial.link_source},
+      {"input_render_device_id", spatial.input_render_device_id},
+      {"returned_render_device_id", spatial.returned_render_device_id},
       {"is_spatial_audio_supported", spatial.spatial_audio_supported},
       {"atmos_home_theater_supported", spatial.atmos_home_theater_supported},
       {"active_format_raw", spatial.active_format_raw},
@@ -234,6 +240,7 @@ namespace {
     return ordered_json::array({
       serialize_mat_profile(mat_profile::mat21, observation.mat21),
       serialize_mat_profile(mat_profile::mat20, observation.mat20),
+      serialize_mat_profile(mat_profile::mat10, observation.mat10),
     });
   }
 
@@ -286,7 +293,7 @@ namespace {
     const probe_observation &observation,
     const gate_result &gate) {
     return {
-      {"schema_version", 1},
+      {"schema_version", 2},
       {"selection", serialize_selection(options)},
       {"selected_endpoint", serialize_endpoint_or_null(observation.selected_endpoint)},
       {"default_render_endpoints", serialize_default_endpoints(observation)},
@@ -640,8 +647,8 @@ namespace {
       return error;
     }
     if (!report.at("schema_version").is_number_integer() ||
-        report.at("schema_version").get<int>() != 1) {
-      return "schema_version must be 1";
+        report.at("schema_version").get<int>() != 2) {
+      return "schema_version must be 2";
     }
 
     const auto &selection = report.at("selection");
@@ -709,6 +716,10 @@ namespace {
           spatial,
           {
             "configuration_available",
+            "selected_endpoint_linked",
+            "link_source",
+            "input_render_device_id",
+            "returned_render_device_id",
             "is_spatial_audio_supported",
             "atmos_home_theater_supported",
             "active_format_raw",
@@ -721,6 +732,7 @@ namespace {
     }
     for (const auto key : {
            "configuration_available",
+           "selected_endpoint_linked",
            "is_spatial_audio_supported",
            "atmos_home_theater_supported",
          }) {
@@ -729,6 +741,9 @@ namespace {
       }
     }
     for (const auto key : {
+           "link_source",
+           "input_render_device_id",
+           "returned_render_device_id",
            "active_format_raw",
            "active_format_guid",
            "default_format_raw",
@@ -739,16 +754,50 @@ namespace {
       }
     }
 
+    const auto selected_endpoint_linked =
+      spatial.at("selected_endpoint_linked").get<bool>();
+    const auto link_source = spatial.at("link_source").get<std::string>();
+    const auto input_render_device_id =
+      spatial.at("input_render_device_id").get<std::string>();
+    const auto returned_render_device_id =
+      spatial.at("returned_render_device_id").get<std::string>();
+    if (link_source != "" && link_source != k_winrt_default_link_source) {
+      return "spatial_audio.link_source is invalid";
+    }
+    if (selected_endpoint_linked) {
+      if (link_source != k_winrt_default_link_source) {
+        return "a linked spatial endpoint requires the default-role link source";
+      }
+      if (input_render_device_id.empty()) {
+        return "a linked spatial endpoint requires a nonempty input_render_device_id";
+      }
+    } else if (!link_source.empty() || !input_render_device_id.empty() ||
+               !returned_render_device_id.empty()) {
+      return "an unlinked spatial endpoint must not contain link identifiers";
+    }
+    if (spatial.at("configuration_available").get<bool>() &&
+        (!selected_endpoint_linked || returned_render_device_id.empty())) {
+      return "an available spatial configuration requires a returned DeviceId";
+    }
+    if (!spatial.at("configuration_available").get<bool>() &&
+        !returned_render_device_id.empty()) {
+      return "returned_render_device_id requires an available spatial configuration";
+    }
+
     const auto &mat_profiles = report.at("mat_profiles");
-    if (!mat_profiles.is_array() || mat_profiles.size() != 2) {
-      return "mat_profiles must contain MAT21 followed by MAT20";
+    if (!mat_profiles.is_array() || mat_profiles.size() != 3) {
+      return "mat_profiles must contain MAT21 followed by MAT20 followed by MAT10";
     }
     validated_mat_profile mat21 {};
     validated_mat_profile mat20 {};
+    validated_mat_profile mat10 {};
     if (const auto error = validate_mat_profile(mat_profiles.at(0), "MAT21", mat21, "mat_profiles[0]")) {
       return error;
     }
     if (const auto error = validate_mat_profile(mat_profiles.at(1), "MAT20", mat20, "mat_profiles[1]")) {
+      return error;
+    }
+    if (const auto error = validate_mat_profile(mat_profiles.at(2), "MAT10", mat10, "mat_profiles[2]")) {
       return error;
     }
 
@@ -800,7 +849,8 @@ namespace {
         return error;
       }
       const auto selected_profile = gate.at("selected_profile").get<std::string>();
-      if (selected_profile != "MAT21" && selected_profile != "MAT20") {
+      if (selected_profile != "MAT21" && selected_profile != "MAT20" &&
+          selected_profile != "MAT10") {
         return "gate.selected_profile is invalid";
       }
     }
@@ -813,18 +863,21 @@ namespace {
         return error;
       }
       const auto name = profile.get<std::string>();
-      if (name != "MAT21" && name != "MAT20") {
+      if (name != "MAT21" && name != "MAT20" && name != "MAT10") {
         return "gate.ready_profiles contains an invalid profile";
       }
       ready_profiles.push_back(name);
     }
-    const std::vector<std::string> expected_ready_profiles = [&mat21, &mat20]() {
+    const std::vector<std::string> expected_ready_profiles = [&mat21, &mat20, &mat10]() {
       std::vector<std::string> result;
       if (mat21.ready) {
         result.emplace_back("MAT21");
       }
       if (mat20.ready) {
         result.emplace_back("MAT20");
+      }
+      if (mat10.ready) {
+        result.emplace_back("MAT10");
       }
       return result;
     }();
@@ -857,16 +910,20 @@ namespace {
       return "audio_bytes_written must be false";
     }
 
+    if (selection_kind == "explicit" && !selected_endpoint.is_null() &&
+        selected_endpoint.at("id").get<std::string>() !=
+          selection.at("requested_endpoint_id").get<std::string>()) {
+      return "an explicit request must match selected_endpoint.id";
+    }
+    if (selection_kind == "explicit" && verdict == "ENDPOINT_PREFLIGHT_READY") {
+      return "an explicit selection cannot be ready without documented API linkage";
+    }
+
     if (verdict != "ENDPOINT_PREFLIGHT_READY") {
       return std::nullopt;
     }
     if (selected_endpoint.is_null()) {
       return "a green report requires a selected endpoint";
-    }
-    if (selection_kind == "explicit" &&
-        selected_endpoint.at("id").get<std::string>() !=
-          selection.at("requested_endpoint_id").get<std::string>()) {
-      return "an explicit request must match selected_endpoint.id";
     }
     if (selected_endpoint.at("state").get<std::uint32_t>() != 1U) {
       return "a green report requires an active endpoint";
@@ -876,6 +933,21 @@ namespace {
     }
     if (selected_endpoint.at("jack_subtype").at("status").get<std::string>() != "HDMI") {
       return "a green report requires HDMI";
+    }
+    const auto selected_endpoint_id = selected_endpoint.at("id").get<std::string>();
+    if (selected_endpoint_id.empty()) {
+      return "a green report requires a nonempty selected endpoint ID";
+    }
+    for (const auto role : {"console", "multimedia", "communications"}) {
+      const auto &default_endpoint = defaults.at(role);
+      if (default_endpoint.is_null() ||
+          default_endpoint.at("id").get<std::string>() != selected_endpoint_id) {
+        return "a green report requires all default roles to match selected_endpoint.id";
+      }
+    }
+    if (!selected_endpoint_linked || input_render_device_id.empty() ||
+        returned_render_device_id != input_render_device_id) {
+      return "a green report requires an exact linked spatial DeviceId";
     }
     if (!spatial.at("configuration_available").get<bool>() ||
         !spatial.at("is_spatial_audio_supported").get<bool>() ||
@@ -893,7 +965,8 @@ namespace {
         std::find(ready_profiles.begin(), ready_profiles.end(), *expected_selected_profile) == ready_profiles.end()) {
       return "a green report requires selected profile ready membership";
     }
-    const auto &selected_mat = *expected_selected_profile == "MAT21" ? mat21 : mat20;
+    const auto &selected_mat = *expected_selected_profile == "MAT21" ? mat21 :
+                               *expected_selected_profile == "MAT20" ? mat20 : mat10;
     if (!selected_mat.ready || selected_mat.format_support_hresult != k_s_ok ||
         selected_mat.initialize_hresult != k_s_ok) {
       return "a green report requires S_OK support and initialization for its selected MAT profile";

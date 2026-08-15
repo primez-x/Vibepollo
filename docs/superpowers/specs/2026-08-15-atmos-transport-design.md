@@ -38,6 +38,8 @@ Vibepollo currently captures shared-mode 48 kHz float PCM and encodes only 2-, 6
 
 Microsoft's SysVAD TabletAudioSample already contains an HDMI endpoint topology and MAT 2.0/MAT 2.1 render data ranges with an eight-lane, 16-bit, 192 kHz carrier. Its public loopback pin remains PCM-only, so the prototype requires a driver-internal tap of bytes consumed from the WaveRT render buffer.
 
+The reviewed no-write probe measured the intended laptop path, `Beyond TV (NVIDIA High Definition Audio)`, as active HDMI with Dolby Atmos for Home Theater active. Its exact exclusive-mode intersection is MAT10 only: MAT10 support and initialization return `S_OK`, while MAT20 and MAT21 return `AUDCLNT_E_UNSUPPORTED_FORMAT`. Therefore the SysVAD-derived source endpoint must add the exact MAT10/MLP data range and prove that the licensed Windows Dolby producer actually selects MAT10. The opaque session may be offered only when the observed host source profile and this client sink profile intersect exactly.
+
 The fixed MAT carrier rate is:
 
 ```
@@ -95,15 +97,16 @@ The client may display the experimental Atmos choice only when every condition b
 
 1. The endpoint is active.
 2. `PKEY_AudioEndpoint_FormFactor` equals `DigitalAudioDisplayDevice` and the physical connector is positively identified as HDMI. Require `PKEY_AudioEndpoint_JackSubType == KSNODETYPE_HDMI_INTERFACE`; an implementation may corroborate it with `IKsJackSinkInformation::GetJackSinkInformation().ConnType == KSJACK_SINK_CONNECTIONTYPE_HDMI`. A missing, malformed, DisplayPort, or inconclusive subtype fails closed.
-3. `SpatialAudioDeviceConfiguration.IsSpatialAudioSupported` is true.
-4. `IsSpatialAudioFormatSupported(DolbyAtmosForHomeTheater)` is true.
-5. `ActiveSpatialAudioFormat` exactly equals Dolby Atmos for Home Theater GUID `{A289735D-FA3E-4E35-9D7D-B6F896ACB2E7}`.
-6. WASAPI exclusive-mode `IsFormatSupported` accepts at least one exact IEC 61937 descriptor from the peer-supported intersection: `KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20` or `KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT21`.
-7. The host advertises the versioned opaque-audio extension.
+3. Spatial configuration is linked to this exact endpoint. `IMMDevice::GetId` and WinRT `MediaDevice`/`DeviceInformation` render-device IDs are distinct opaque namespaces: never pass the former to `SpatialAudioDeviceConfiguration`. For default selection, bookend endpoint, spatial, and MAT observation by sampling all three Core Audio default roles plus the WinRT Default and Communications render IDs before and after it; authorize the link only when the selected endpoint and the nonempty opaque WinRT ID remain exact throughout. An explicit endpoint needs an API-provided link to its WinRT render-device ID; an unlinked or changed endpoint fails closed.
+4. `SpatialAudioDeviceConfiguration.IsSpatialAudioSupported` is true.
+5. `IsSpatialAudioFormatSupported(DolbyAtmosForHomeTheater)` is true.
+6. `ActiveSpatialAudioFormat` exactly equals Dolby Atmos for Home Theater GUID `{A289735D-FA3E-4E35-9D7D-B6F896ACB2E7}`.
+7. WASAPI exclusive-mode `IsFormatSupported` accepts at least one exact IEC 61937 descriptor from the peer-supported intersection: `KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP` (MAT10), `KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20`, or `KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT21`.
+8. The host advertises the versioned opaque-audio extension.
 
 The UI must not use the default spatial format as a substitute for the active format. Atmos for Headphones, Windows Sonic, DTS, inactive endpoints, Bluetooth, DisplayPort, and ordinary multichannel PCM do not satisfy the gate. Windows groups HDMI and DisplayPort under `DigitalAudioDisplayDevice`, so the form-factor property alone is insufficient.
 
-At stream start, the client repeats the checks and performs an exclusive-mode `IAudioClient::Initialize` preflight for the negotiated exact format. The mode is committed only after initialization succeeds. Discovery makes the choice visible; the start-time preflight authorizes actual use.
+At stream start, the client repeats the checks and performs an exclusive-mode `IAudioClient::Initialize` preflight for the negotiated exact format. The mode is committed only after initialization succeeds. Discovery makes the choice visible; the start-time preflight authorizes actual use. The capability report uses schema version 2 and records link provenance plus the opaque WinRT input and API-returned configuration IDs separately from the opaque MMDevice ID.
 
 ### Host activation gate
 
@@ -119,13 +122,15 @@ The host may accept an opaque MAT request only when:
 
 Public Windows APIs do not allow Vibepollo to activate a spatial provider it does not own. The prototype therefore expects a one-time user selection of Dolby Atmos for Home Theater in Windows/Dolby Access. Vibepollo verifies that state and explains a failed preflight; it does not use undocumented registry edits.
 
+Client sink support for MAT10, MAT20, or MAT21 does not prove that the host source emits that profile. The host gate's active-render-format observation must match the negotiated profile, and the later legal OS-generated spatial-stream test must independently confirm receiver Atmos lock on that route.
+
 ### Negotiated descriptor
 
 The protocol represents opaque audio separately from the legacy channel layout:
 
 ```text
 codec:          OPAQUE_IEC61937
-profile:        MAT20 | MAT21
+profile:        MAT10 | MAT20 | MAT21
 sample_rate:    192000
 carrier_lanes:  8
 sample_bits:    16
@@ -134,9 +139,9 @@ byte_rate:      3072000
 version:        1
 ```
 
-The Windows preflight builds the documented 52-byte `WAVEFORMATEXTENSIBLE_IEC61937` form: `WAVE_FORMAT_EXTENSIBLE`, `nChannels=8`, `nSamplesPerSec=192000`, `nAvgBytesPerSec=3072000`, `nBlockAlign=16`, `wBitsPerSample=16`, `cbSize=34`, valid bits `16`, and `KSAUDIO_SPEAKER_7POINT1`. The decoded-content fields are `dwEncodedSamplesPerSec=96000`, `dwEncodedChannelCount=8`, and `dwAverageBytesPerSec=0`. MAT20 uses subformat GUID `{0000010C-0CEA-0010-8000-00AA00389B71}`; MAT21 uses `{0000030C-0CEA-0010-8000-00AA00389B71}`.
+The Windows preflight builds the documented 52-byte `WAVEFORMATEXTENSIBLE_IEC61937` form: `WAVE_FORMAT_EXTENSIBLE`, `nChannels=8`, `nSamplesPerSec=192000`, `nAvgBytesPerSec=3072000`, `nBlockAlign=16`, `wBitsPerSample=16`, `cbSize=34`, valid bits `16`, and `KSAUDIO_SPEAKER_7POINT1`. The decoded-content fields are `dwEncodedSamplesPerSec=96000`, `dwEncodedChannelCount=8`, and `dwAverageBytesPerSec=0`. MAT10 (`KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP`) uses `{0000000C-0CEA-0010-8000-00AA00389B71}`; MAT20 uses `{0000010C-0CEA-0010-8000-00AA00389B71}`; MAT21 uses `{0000030C-0CEA-0010-8000-00AA00389B71}`.
 
-An exact MAT version is required. Support for MAT20 never implies MAT21 support, or vice versa. The legacy channel-count and Opus mapping fields remain unchanged and are ignored only after both peers explicitly commit the opaque descriptor.
+An exact MAT version is required. Support for any of MAT10, MAT20, and MAT21 never implies support for either other profile. The sink selects the highest independently ready profile in order MAT21, MAT20, MAT10, subject to the peer/source intersection. The legacy channel-count and Opus mapping fields remain unchanged and are ignored only after both peers explicitly commit the opaque descriptor.
 
 ## Virtual HDMI driver
 
@@ -208,7 +213,7 @@ The host estimates the physical HDMI rate from deltas of device position and the
 Add a namespaced Vibepollo/Moonlight RTSP extension rather than overloading `audioChannels`, `surroundAudioInfo`, or an Opus mapping. The host DESCRIBE advertises `x-ss-audio[0].opaqueTransport:1`, exact profiles, and `clock-buffer-v1` feedback. After local discovery passes, the client ANNOUNCE offers `x-ml-audio[0].opaqueTransport:1`, its exact profiles, receive window, and feedback support. The audio SETUP response commits the selected transport with:
 
 ```text
-X-SS-Audio-Transport: opaque-iec61937;version=1;format=mat20|mat21;clock=192000;fec=4+2;pt=99;payload=1200;salt=<32 lowercase hex digits>
+X-SS-Audio-Transport: opaque-iec61937;version=1;format=mat10|mat20|mat21;clock=192000;fec=4+2;pt=99;payload=1200;salt=<32 lowercase hex digits>
 ```
 
 Opaque version 1 additionally requires the paired session's encrypted-control-v2 capability. A missing, malformed, unauthenticated, unsupported, or non-opaque SETUP result selects legacy Opus before launch.
@@ -233,7 +238,7 @@ Opaque data uses RTP payload type 99 with a 192 kHz clock; payload type 127 rema
 
 ```text
 u8  version = 1
-u8  profile = 1 MAT20 | 2 MAT21
+u8  profile = 1 MAT20 | 2 MAT21 | 3 MAT10
 u16 flags
 u64 epoch
 u64 packet_sequence
@@ -291,7 +296,7 @@ Preflight failures are actionable and name the failed condition, for example:
 
 - selected endpoint is not HDMI;
 - Dolby Atmos for Home Theater is installed but not active;
-- the TV/eARC route does not accept MAT20 or MAT21 exclusively;
+- the TV/eARC route does not accept MAT10, MAT20, or MAT21 exclusively;
 - the host or client fork lacks opaque-audio version 1;
 - exclusive access is held by another application.
 

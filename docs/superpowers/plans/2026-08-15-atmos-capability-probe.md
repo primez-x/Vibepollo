@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build one no-audio-write Windows executable that determines whether an exact render endpoint passes the endpoint half of the Atmos sink gate: active HDMI, Dolby Atmos for Home Theater active, and exact MAT 2.0 or MAT 2.1 WASAPI exclusive initialization.
+**Goal:** Build one no-audio-write Windows executable that determines whether an exact render endpoint passes the endpoint half of the Atmos sink gate: active HDMI, Dolby Atmos for Home Theater active, and exact MAT 1.0, MAT 2.0, or MAT 2.1 WASAPI exclusive initialization.
 
 **Architecture:** Keep canonical endpoint observations separate from a portable, deterministic gate evaluator. A Windows adapter collects MMDevice, C++/WinRT spatial-audio, and exact IEC 61937 results; a tested application coordinator binds explicit endpoint selection, collection, evaluation, invariant-checked reporting, and exit mapping. The same release executable and SHA-256 are run on the host and laptop. A green result is named `ENDPOINT_PREFLIGHT_READY`: it authorizes only the later legal OS-generated spatial-stream/receiver-lock test and never claims that the downstream TV/eARC/soundbar has taken Atmos lock.
 
@@ -10,20 +10,27 @@
 
 ## Global Constraints
 
-- Primary source baseline is `Nonary/Vibepollo` commit `b85bd588431030c998f3b0e6968317554d046252`; work stays on branch `agent/atmos-transport` in the existing isolated worktree.
-- The selected endpoint alone drives the verdict; enumeration of default roles and other active endpoints is diagnostic context only.
+- Primary source baseline is the newest published `Nonary/Vibepollo` alpha tag `1.19.0-alpha.2`, commit `258179a4a88e469f17c6bae3a2109130d7357fd8` (`vibe-test`); work stays on branch `agent/atmos-transport` in the existing isolated worktree.
+- A default selection may reach `ENDPOINT_PREFLIGHT_READY` only when all three Core Audio default roles (`eConsole`, `eMultimedia`, and `eCommunications`) resolve to the selected endpoint before and after endpoint, spatial, and MAT observation, and the WinRT Default and Communications render IDs are nonempty and remain exactly equal across the same bookends. Other active endpoints remain diagnostic context only. An explicit endpoint remains available for Core Audio inspection but fails the spatial-link gate closed in this slice.
 - Require both `PKEY_AudioEndpoint_FormFactor == DigitalAudioDisplayDevice` and a valid `PKEY_AudioEndpoint_JackSubType` string equal to the authoritative HDMI node-type GUID `{D1B9CC2A-F519-417F-91C9-55FA65481001}`. Define HDMI and DisplayPort (`{E47E4031-3EA6-418D-8F9B-B73843CCBA97}`) locally because the selected MinGW `ksmedia.h` omits both symbols. Missing, wrong-type, malformed, DisplayPort, and other subtypes fail closed.
 - Require `IsSpatialAudioSupported`, support for `DolbyAtmosForHomeTheater`, and an `ActiveSpatialAudioFormat` equal to `{A289735D-FA3E-4E35-9D7D-B6F896ACB2E7}`. `DefaultSpatialAudioFormat` is diagnostic only.
-- Probe MAT20 and MAT21 independently. Support for one never implies support for the other; prefer MAT21 only when its own exact support and initialization both return `S_OK`.
+- Probe MAT10, MAT20, and MAT21 independently. Support for one never implies support for another; select only a profile whose own exact support and initialization both return `S_OK`, in strict preference order MAT21, then MAT20, then MAT10.
 - Build the exact 52-byte Microsoft IEC 61937 descriptor: 8 lanes, 192000 carrier frames/s, 3072000 bytes/s, 16-byte alignment, 16 bits, `cbSize=34`, `KSAUDIO_SPEAKER_7POINT1`, encoded rate 96000, encoded channels 8, encoded average bytes/s 0.
-- MAT20 is `{0000010C-0CEA-0010-8000-00AA00389B71}` and MAT21 is `{0000030C-0CEA-0010-8000-00AA00389B71}`. Define these documented GUIDs locally because the current MinGW `ksmedia.h` omits their symbolic constants.
+- MAT10 is `{0000000C-0CEA-0010-8000-00AA00389B71}`, MAT20 is `{0000010C-0CEA-0010-8000-00AA00389B71}`, and MAT21 is `{0000030C-0CEA-0010-8000-00AA00389B71}`. Define these documented `KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_*` GUIDs locally because the current MinGW `ksmedia.h` omits their symbolic constants.
 - Each `IAudioClient::Initialize` attempt uses a fresh activated client with `AUDCLNT_SHAREMODE_EXCLUSIVE`, `AUDCLNT_STREAMFLAGS_NOPERSIST`, durations `0, 0`, and the exact descriptor.
 - Never call `IAudioClient::GetService`, `IAudioRenderClient::GetBuffer`, `ReleaseBuffer`, or `IAudioClient::Start`; the report must always contain `"audio_bytes_written": false`. Exclusive `Initialize` may briefly reserve the endpoint, but no renderer service or sample buffer is acquired.
 - Run C++/WinRT and raw COM from one STA initialized by `winrt::init_apartment(winrt::apartment_type::single_threaded)`; do not also call `CoInitializeEx`.
 - This slice does not install a driver, enable test signing, reboot either machine, change a Windows spatial setting, modify the live Vibepollo install, or play bundled Dolby payloads.
 - A blocked baseline is a stop condition for this slice. Retain its report and defer any single-variable endpoint/spatial remediation to a separately authorized measured stage.
 - `ENDPOINT_PREFLIGHT_READY` does not prove the physical sink. Before any driver/test-signing stage, a separate legal OS-generated spatial stream must make the actual receiver report Atmos lock on the same selected route.
+- Sink acceptance for MAT10, MAT20, or MAT21 is not evidence that the host source emits that profile. Keep the later exact source-profile observation and the separate receiver-lock test as independent gates; only a matching observed source profile may be negotiated to the client.
 - Preserve the existing stereo/5.1/7.1 Opus implementation and all unrelated user work.
+
+## Validated laptop result
+
+The independently reviewed schema-v2 executable with SHA-256 `C24D18F2D825A2C13EC6D969F16E2EF09E695E5B3D327AA20F7A4D51CD9FF7DD` ran in laptop session 1 against `Beyond TV (NVIDIA High Definition Audio)` and returned `ENDPOINT_PREFLIGHT_READY` with MAT10 as the only ready profile. The selected endpoint was active display-audio HDMI; all three Core Audio default roles and the bookended WinRT IDs matched; Dolby Atmos for Home Theater was supported and active; MAT10 returned exact `S_OK` for both support and fresh-client initialization; MAT20 and MAT21 returned `AUDCLNT_E_UNSUPPORTED_FORMAT`. The report contained zero diagnostics, zero probe errors, and `audio_bytes_written=false`. The scheduled task was removed, no probe process remained, and the canonical four-value endpoint/spatial registry snapshot remained byte-for-byte unchanged at SHA-256 `D199DBDC1A35D850E5051BB8A50D2112CA562B4020C0B0C97EF6C235B6C1AFD7`.
+
+This authorizes the next source-profile and receiver-lock experiments only. It also makes MAT10 support a required source-side prototype profile; a MAT20/MAT21-only virtual endpoint cannot form an exact opaque intersection with this measured client route.
 
 ---
 
@@ -36,11 +43,11 @@
 - Create `tools/atmos_capability_probe_cli.h`: Windows-free CLI option and parse-result contracts.
 - Create `tools/atmos_capability_probe_cli.cpp`: strict argument parser for `--json`, `--endpoint-id`, and `--help`.
 - Create `tools/atmos_capability_probe_app.h`: Windows-free observation-provider, application-result, report-validation, and coordinator contracts.
-- Create `tools/atmos_capability_probe_app.cpp`: explicit selection wiring, invariant-checked ordered JSON/human output, and process exit mapping.
+- Create `tools/atmos_capability_probe_app.cpp`: default and explicit selection wiring, invariant-checked ordered JSON/human output, and process exit mapping.
 - Create `tools/atmos_capability_probe.cpp`: thin STA lifetime and Windows-provider entry point.
 - Create `tests/unit/test_atmos_capability_probe_policy.cpp`: portable gate truth-table tests with hand-derived expectations.
 - Create `tests/unit/test_atmos_capability_probe_cli.cpp`: portable CLI behavior tests.
-- Create `tests/unit/test_atmos_capability_probe_app.cpp`: portable explicit-ID-to-report integration and 0/1/2/3 exit-contract tests.
+- Create `tests/unit/test_atmos_capability_probe_app.cpp`: portable default-ready and explicit-blocked integration plus 0/1/2/3 exit-contract tests.
 - Create `tests/unit/platform/windows/test_atmos_capability_probe_windows.cpp`: exact 52-byte descriptor and HDMI GUID parser tests using real production helpers.
 - Modify `tools/CMakeLists.txt`: add the standalone probe target with only its required libraries.
 - Modify `tests/CMakeLists.txt`: register three portable component tests and one Windows-only descriptor test.
@@ -125,7 +132,7 @@ Create `tools/atmos_capability_probe_policy.h` with this public shape:
 namespace atmos_probe {
   using hresult_code = std::int32_t;
 
-  enum class mat_profile { mat20, mat21 };
+  enum class mat_profile { mat10, mat20, mat21 };
 
   struct probe_options {
     std::optional<std::string> endpoint_id;
@@ -141,6 +148,10 @@ namespace atmos_probe {
     spatial_audio_unsupported,
     atmos_home_theater_unsupported,
     active_spatial_format_not_atmos_home_theater,
+    spatial_device_id_unlinked,
+    mat10_exclusive_probe_failed,
+    mat10_exclusive_format_unsupported,
+    mat10_exclusive_initialize_failed,
     mat20_exclusive_probe_failed,
     mat20_exclusive_format_unsupported,
     mat20_exclusive_initialize_failed,
@@ -173,7 +184,7 @@ namespace atmos_probe {
     other_connector_guid>;
 
   struct endpoint_observation {
-    std::string id;
+    std::string id;  // Opaque MMDevice ID; never pass to SpatialAudioDeviceConfiguration.
     std::string friendly_name;
     std::uint32_t state {};
     form_factor_observation form_factor {property_missing {}};
@@ -186,6 +197,10 @@ namespace atmos_probe {
   };
 
   struct spatial_observation {
+    bool selected_endpoint_linked {};
+    std::string link_source;
+    std::string input_render_device_id;  // Opaque WinRT MediaDevice ID.
+    std::string returned_render_device_id;
     bool configuration_available {};
     bool spatial_audio_supported {};
     bool atmos_home_theater_supported {};
@@ -213,6 +228,7 @@ namespace atmos_probe {
     spatial_observation spatial;
     mat_observation mat21;
     mat_observation mat20;
+    mat_observation mat10;
     std::vector<api_error> errors;
   };
 
@@ -238,7 +254,7 @@ Create `tools/atmos_capability_probe_policy.cpp` with only this include so CMake
 #include "tools/atmos_capability_probe_policy.h"
 ```
 
-Write table-driven GoogleTests using literal observations and the tagged property alternatives. The first two tests assert that an otherwise valid observation with MAT21 `S_OK/S_OK` selects MAT21, while MAT20-only `S_OK/S_OK` selects MAT20 without inferring MAT21. Build expected vectors as literals rather than calling production name helpers. Because activity is derived from the raw state and connector/form-factor truth is represented by mutually exclusive variants, contradictory `inactive + active=true` or `malformed + hdmi=true` fixtures are not representable.
+Write table-driven GoogleTests using literal observations and the tagged property alternatives. The first three tests assert that an otherwise valid observation selects MAT21, then MAT20, then MAT10 only when that profile's own support and initialization are `S_OK`; no test may infer one profile from another. Add a three-ready fixture that selects MAT21 with ready-profile order `[MAT21, MAT20, MAT10]`. Build expected vectors as literals rather than calling production name helpers. Because activity is derived from the raw state and connector/form-factor truth is represented by mutually exclusive variants, contradictory `inactive + active=true` or `malformed + hdmi=true` fixtures are not representable.
 
 - [ ] **Step 2: Register and run the policy test to verify RED**
 
@@ -264,9 +280,9 @@ Expected RED: the target link fails with an undefined reference to `atmos_probe:
 
 - [ ] **Step 3: Implement the smallest fail-closed evaluator**
 
-Implement exact-`S_OK` readiness (`HRESULT == 0`). Derive active state from raw state value `1` (`DEVICE_STATE_ACTIVE`), display-audio state only from the `display_audio_form_factor` alternative, and HDMI state only from the `hdmi_connector` alternative. Missing endpoint returns only `SELECTED_ENDPOINT_NOT_FOUND`. Otherwise emit diagnostics in endpoint, spatial, MAT20, MAT21, then summary order. If the spatial configuration is unavailable, do not emit subordinate spatial conditions. A profile is ready only when both optional HRESULTs are present and exactly zero.
+Implement exact-`S_OK` readiness (`HRESULT == 0`). Derive active state from raw state value `1` (`DEVICE_STATE_ACTIVE`), display-audio state only from the `display_audio_form_factor` alternative, and HDMI state only from the `hdmi_connector` alternative. Missing endpoint returns only `SELECTED_ENDPOINT_NOT_FOUND`. Otherwise emit diagnostics in endpoint, spatial, MAT10, MAT20, MAT21, then summary order. A missing or mismatched linked WinRT render-device ID emits `SPATIAL_DEVICE_ID_UNLINKED` and prevents readiness; an unavailable spatial configuration emits `SPATIAL_CONFIGURATION_UNAVAILABLE` and suppresses subordinate spatial conditions. A profile is ready only when both optional HRESULTs are present and exactly zero.
 
-Check ready profiles in MAT21-then-MAT20 preference order. When neither is ready, emit `*_PROBE_FAILED` for a missing support HRESULT, `*_FORMAT_UNSUPPORTED` for a nonzero support result, or `*_INITIALIZE_FAILED` when support is zero but initialization is missing/nonzero, followed by `NO_EXCLUSIVE_MAT_PROFILE_READY`. `PROBE_RUNTIME_ERROR` always prevents readiness.
+Check ready profiles in MAT21-then-MAT20-then-MAT10 preference order. When none is ready, emit `*_PROBE_FAILED` for a missing support HRESULT, `*_FORMAT_UNSUPPORTED` for a nonzero support result, or `*_INITIALIZE_FAILED` when support is zero but initialization is missing/nonzero, followed by `NO_EXCLUSIVE_MAT_PROFILE_READY`. `PROBE_RUNTIME_ERROR` always prevents readiness.
 
 Implement both `to_string` overloads with exhaustive switches. Diagnostic strings are the uppercase enum spellings, including `SELECTED_ENDPOINT_NOT_DISPLAY_AUDIO` and `SELECTED_ENDPOINT_NOT_HDMI` as separate failures.
 
@@ -283,11 +299,13 @@ inactive raw state with otherwise passing canonical properties -> SELECTED_ENDPO
 DisplayPort, other GUID, malformed, missing, or wrong-type connector alternative -> SELECTED_ENDPOINT_NOT_HDMI
 missing, wrong-type, or other form-factor alternative -> SELECTED_ENDPOINT_NOT_DISPLAY_AUDIO
 spatial configuration unavailable -> SPATIAL_CONFIGURATION_UNAVAILABLE
+explicit endpoint without a proven WinRT render-device link -> SPATIAL_DEVICE_ID_UNLINKED
 spatial supported and provider supported but active GUID is Sonic -> ACTIVE_SPATIAL_FORMAT_NOT_ATMOS_HOME_THEATER
 default format Atmos but active format not Atmos -> blocked
 MAT21 support S_OK plus Initialize AUDCLNT_E_DEVICE_IN_USE -> MAT21_EXCLUSIVE_INITIALIZE_FAILED
-both format checks unsupported -> MAT20/MAT21 format codes then NO_EXCLUSIVE_MAT_PROFILE_READY
-MAT20 and MAT21 ready -> ready profile order [MAT21, MAT20], selected MAT21
+MAT10 support S_OK plus Initialize AUDCLNT_E_DEVICE_IN_USE -> MAT10_EXCLUSIVE_INITIALIZE_FAILED
+all format checks unsupported -> MAT10/MAT20/MAT21 format codes then NO_EXCLUSIVE_MAT_PROFILE_READY
+MAT10, MAT20, and MAT21 ready -> ready profile order [MAT21, MAT20, MAT10], selected MAT21
 probe_complete false -> PROBE_RUNTIME_ERROR even when every capability field otherwise passes
 ```
 
@@ -350,6 +368,10 @@ namespace atmos_probe {
     0x0000010c, 0x0cea, 0x0010,
     {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
   };
+  inline constexpr GUID k_iec61937_dolby_mlp {
+    0x0000000c, 0x0cea, 0x0010,
+    {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
+  };
   inline constexpr GUID k_iec61937_dolby_mat21 {
     0x0000030c, 0x0cea, 0x0010,
     {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
@@ -363,7 +385,7 @@ namespace atmos_probe {
 }
 ```
 
-Write tests with literal expected fields for both profiles:
+Write tests with literal expected fields for all three profiles:
 
 ```cpp
 static_assert(sizeof(WAVEFORMATEXTENSIBLE_IEC61937) == 52);
@@ -386,7 +408,7 @@ TEST(AtmosCapabilityProbeWindows, BuildsExactMat21Descriptor) {
 }
 ```
 
-Add the corresponding MAT20 test plus property-decoder tests that:
+Add corresponding MAT20 and MAT10 tests plus property-decoder tests that:
 
 ```text
 accept official HDMI {D1B9CC2A-F519-417F-91C9-55FA65481001}
@@ -446,11 +468,15 @@ Implement `collect_windows_observation` with these exact operations:
 2. Read all three role defaults (`eConsole`, `eMultimedia`, `eCommunications`) into the fixed role array.
 3. Select `GetDefaultAudioEndpoint(eRender, eConsole)` unless `endpoint_id` is present; for an explicit ID call `IMMDeviceEnumerator::GetDevice` and keep a not-found selection as a normal blocked observation.
 4. For every endpoint, read `GetId`, `GetState`, `PKEY_Device_FriendlyName`, `PKEY_AudioEndpoint_FormFactor`, and `PKEY_AudioEndpoint_JackSubType`. Pass the exact `PROPVARIANT`s through the production decoders; do not store independent `active`, `is_display_audio`, or `is_hdmi` booleans.
-5. Call `SpatialAudioDeviceConfiguration::GetForDeviceId(winrt::to_hstring(endpoint.id))`; record `IsSpatialAudioSupported`, `IsSpatialAudioFormatSupported(SpatialAudioFormatSubtype::DolbyAtmosForHomeTheater())`, and raw/canonical active and default format strings.
-6. For MAT21 then MAT20, activate a fresh `IAudioClient`, call exclusive `IsFormatSupported` with `nullptr` closest-match output, release it, activate another fresh client, and call `Initialize` only when exact support returned `S_OK`.
-7. Release a successfully initialized client immediately. Do not obtain a render service, buffer, or start the stream.
+5. Treat `IMMDevice::GetId` and WinRT render-device IDs as distinct opaque namespaces. Never pass an MMDevice ID to `SpatialAudioDeviceConfiguration`. For default selection, first require all three Core Audio default roles to resolve to the selected endpoint, then take the initial `MediaDevice::GetDefaultAudioRenderId()` samples for the WinRT Default and Communications roles and require both IDs to be nonempty and exactly equal. Delay committing the public spatial link. For an explicit endpoint, record no spatial link in this slice and fail the spatial gate closed; never infer a link from names or ID text.
+6. Call `SpatialAudioDeviceConfiguration::GetForDeviceId` only with the linked opaque WinRT render-device ID; record `IsSpatialAudioSupported`, `IsSpatialAudioFormatSupported(SpatialAudioFormatSubtype::DolbyAtmosForHomeTheater())`, and raw/canonical active and default format strings.
+7. For MAT21 then MAT20 then MAT10, activate a fresh `IAudioClient`, call exclusive `IsFormatSupported` with `nullptr` closest-match output, release it, activate another fresh client, and call `Initialize` only when exact support returned `S_OK`.
+8. After all MAT observations, re-read the three Core Audio default role IDs and both WinRT default render IDs. Set `selected_endpoint_linked` and its fixed `link_source` only if the selected endpoint and opaque WinRT ID remain exact across both bookends; otherwise clear the spatial observation and fail closed. An API failure in the final sample is a runtime probe error.
+9. Release a successfully initialized client immediately. Do not obtain a render service, buffer, or start the stream.
 
-Use the `util::safe_ptr`/`Release`/`CoTaskMemFree` and `PROPVARIANT` RAII patterns already present in `tools/audio.cpp`. Limit C++/WinRT to the spatial configuration API. Convert caught `winrt::hresult_error` values to `api_error` entries and mark only genuinely incomplete top-level enumeration as `probe_complete=false`; endpoint/spatial/profile failures retain their precise gate fields and HRESULTs. The public Windows adapter exposes observations and preflight operations only—no renderer type, render callback, or payload-writing abstraction belongs in this seam.
+For this boundary, the C++/WinRT allowance includes `MediaDevice` only to obtain the API-provided default render IDs and `SpatialAudioDeviceConfiguration` to query that exact opaque ID.
+
+Use the `util::safe_ptr`/`Release`/`CoTaskMemFree` and `PROPVARIANT` RAII patterns already present in `tools/audio.cpp`. Limit C++/WinRT to `MediaDevice` default-ID lookup and the spatial configuration API. Convert caught `winrt::hresult_error` values to `api_error` entries and mark only genuinely incomplete top-level enumeration as `probe_complete=false`; endpoint/spatial/profile failures retain their precise gate fields and HRESULTs. The public Windows adapter exposes observations and preflight operations only—no renderer type, render callback, or payload-writing abstraction belongs in this seam.
 
 - [ ] **Step 5: Audit for render calls and verify both tests**
 
@@ -566,13 +592,14 @@ namespace atmos_probe {
 }
 ```
 
-Use `nlohmann::ordered_json` privately in the implementation rather than exposing its concrete template in the public header. Write `test_atmos_capability_probe_app.cpp` with a lambda provider that captures the received `probe_options`, returns one literal canonical MAT21-ready observation, and calls `run_probe` with a `std::array<std::string_view, 3>{"--endpoint-id", "exact-id", "--json"}`. Parse the returned JSON and assert all of the following together:
+Use `nlohmann::ordered_json` privately in the implementation rather than exposing its concrete template in the public header. Write `test_atmos_capability_probe_app.cpp` with a lambda provider that captures the received `probe_options`, returns one literal canonical MAT21-ready default observation with all three matching Core Audio roles and an exact linked opaque WinRT render ID, and calls `run_probe` with `--json`. Parse the returned JSON and assert all of the following together:
 
 ```text
-captured provider endpoint_id == exact-id
-selection.kind == explicit
-selection.requested_endpoint_id == exact-id
-selected_endpoint.id == exact-id
+captured provider endpoint_id is absent
+schema_version == 2
+selection.kind == default:eConsole
+selection.requested_endpoint_id == null
+all three default_render_endpoints IDs equal selected_endpoint.id
 gate.verdict == ENDPOINT_PREFLIGHT_READY
 gate.selected_profile == MAT21
 gate.selected_profile is present in gate.ready_profiles
@@ -580,11 +607,15 @@ the matching MAT21 object has format_support_hresult == 0x00000000
 the matching MAT21 object has initialize_hresult == 0x00000000
 selected endpoint state is active, form-factor status is DISPLAY_AUDIO, connector status is HDMI
 spatial_audio.active_format_guid == {A289735D-FA3E-4E35-9D7D-B6F896ACB2E7}
+spatial_audio.selected_endpoint_linked == true
+spatial_audio.link_source == winrt_default_and_communications
+spatial_audio.input_render_device_id is nonempty
+spatial_audio.returned_render_device_id == spatial_audio.input_render_device_id
 audio_bytes_written == false
 exit_code == 0
 ```
 
-Add fixtures that mutate one prerequisite at a time (selected ID, state, form factor, connector, active Atmos GUID, selected/ready profile membership, either MAT HRESULT, or `audio_bytes_written`), reserialize, and require `validate_serialized_report` to reject the inconsistent green report. Also test a canonical blocked observation maps to exit `1`, invalid arguments map to exit `2` without invoking the provider, a throwing provider maps to exit `3`, and help maps to exit `0` without invoking the provider.
+Add a separate explicit-selection fixture proving the endpoint ID reaches the provider byte-for-byte, remains in the report, and produces `BLOCKED`/exit `1` when spatial linkage is absent. A hostile provider that synthesizes linked fields for an explicit request must be rejected with exit `3` and no green report. Add fixtures that mutate one green prerequisite at a time (selected/default IDs, state, form factor, connector, linked-ID fields, active Atmos GUID, selected/ready profile membership, either MAT HRESULT, or `audio_bytes_written`), reserialize, and require `validate_serialized_report` to reject the inconsistent green report. Also test a canonical blocked observation maps to exit `1`, invalid arguments map to exit `2` without invoking the provider, a throwing provider maps to exit `3`, and help maps to exit `0` without invoking the provider.
 
 Register outside `if(WIN32)`:
 
@@ -602,7 +633,7 @@ sunshine_register_component(
 
 The repository's common dependency module already makes `nlohmann_json::nlohmann_json` available globally. Build this target before defining `run_probe` and require an undefined-reference RED that proves the test reaches the production coordinator.
 
-- [ ] **Step 3: Implement explicit selection wiring and the stable report**
+- [ ] **Step 3: Implement selection wiring and the stable report**
 
 Implement `run_probe` so the parsed endpoint ID is copied byte-for-byte into `probe_options`, the provider is invoked exactly once, and the selection object is constructed by the coordinator rather than trusted from the provider. Call `evaluate`, construct a `nlohmann::ordered_json` report, serialize it, then call the same `validate_serialized_report` entry point exercised by tests. Any exception or invalid green invariant returns exit `3` and must never emit `ENDPOINT_PREFLIGHT_READY`.
 
@@ -610,13 +641,17 @@ Use this field order:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "selection": {"kind": "default:eConsole", "requested_endpoint_id": null},
   "selected_endpoint": null,
   "default_render_endpoints": {"console": null, "multimedia": null, "communications": null},
   "active_render_endpoints": [],
   "spatial_audio": {
     "configuration_available": false,
+    "selected_endpoint_linked": false,
+    "link_source": "",
+    "input_render_device_id": "",
+    "returned_render_device_id": "",
     "is_spatial_audio_supported": false,
     "atmos_home_theater_supported": false,
     "active_format_raw": "",
@@ -631,9 +666,9 @@ Use this field order:
 }
 ```
 
-Each endpoint object derives all presentation fields from its canonical observation in one serializer: `id`, `friendly_name`, numeric `state`, derived `state_name`, a tagged `form_factor` object, a tagged `jack_subtype` object, and derived `is_display_audio`/`is_hdmi`. No independently collected readiness booleans are serialized. Each MAT object contains `profile`, nullable fixed-width `format_support_hresult`, nullable fixed-width `initialize_hresult`, human-readable HRESULT labels, and derived `ready`. HRESULT strings use `0x` plus exactly eight uppercase hexadecimal digits. Recognize `S_OK`, `AUDCLNT_E_DEVICE_IN_USE`, `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`, `AUDCLNT_E_DEVICE_INVALIDATED`, and `AUDCLNT_E_UNSUPPORTED_FORMAT`; preserve unknown values as `UNKNOWN_HRESULT`.
+Each endpoint object derives all presentation fields from its canonical observation in one serializer: `id`, `friendly_name`, numeric `state`, derived `state_name`, a tagged `form_factor` object, a tagged `jack_subtype` object, and derived `is_display_audio`/`is_hdmi`. No independently collected readiness booleans are serialized. Serialize `selected_endpoint_linked`, the fixed `link_source`, the opaque WinRT input ID, and the API-returned configuration ID separately under `spatial_audio`; never compare either WinRT ID textually with the MMDevice ID. All link fields are empty when explicit-endpoint linkage cannot be proved. Each MAT object contains `profile`, nullable fixed-width `format_support_hresult`, nullable fixed-width `initialize_hresult`, human-readable HRESULT labels, and derived `ready`. HRESULT strings use `0x` plus exactly eight uppercase hexadecimal digits. Recognize `S_OK`, `AUDCLNT_E_DEVICE_IN_USE`, `AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED`, `AUDCLNT_E_DEVICE_INVALIDATED`, and `AUDCLNT_E_UNSUPPORTED_FORMAT`; preserve unknown values as `UNKNOWN_HRESULT`.
 
-Before green serialization, require: an explicit request matches `selected_endpoint.id`; the endpoint is active display-audio HDMI; the exact active Atmos Home Theater GUID is present; selected profile is a member of `ready_profiles`; and that same MAT object has both HRESULTs exactly zero. Human output starts with `ENDPOINT_PREFLIGHT_READY: MAT21`, `ENDPOINT_PREFLIGHT_READY: MAT20`, or `BLOCKED`, then prints the selected endpoint and diagnostics. Help and both output modes state: "Endpoint preflight does not prove downstream receiver Atmos lock." Neither mode writes a file or Windows setting.
+Before green serialization, require: selection is default (explicit requests cannot be ready in this slice); all three Core Audio default IDs equal `selected_endpoint.id`; the spatial link source is `winrt_default_and_communications`; the opaque WinRT input ID is nonempty; the returned configuration ID exactly equals that input; the endpoint is active display-audio HDMI; the exact active Atmos Home Theater GUID is present; selected profile is a member of `ready_profiles`; and that same MAT object has both HRESULTs exactly zero. Human output starts with `ENDPOINT_PREFLIGHT_READY: MAT21`, `ENDPOINT_PREFLIGHT_READY: MAT20`, `ENDPOINT_PREFLIGHT_READY: MAT10`, or `BLOCKED`, then prints the selected endpoint and diagnostics. Help and both output modes state: "Endpoint preflight does not prove source-profile emission or downstream receiver Atmos lock." Neither mode writes a file or Windows setting.
 
 Make `tools/atmos_capability_probe.cpp` a thin entry point: initialize one STA with `winrt::init_apartment`, pass `collect_windows_observation` to `run_probe`, print its returned streams, and return its exit code. Catch apartment initialization failure and map it to exit `3`.
 
@@ -678,25 +713,30 @@ sha256sum ./build/tools/atmos-capability-probe.exe > build/atmos-probe.sha256
 ldd ./build/tools/atmos-capability-probe.exe
 ```
 
-Accept host exit `0` or `1`; any other code is a probe failure. Parse the report and run the same invariant checks as the application test: schema `1`, no audio bytes, exact requested/selected ID equality when explicit, and every `ENDPOINT_PREFLIGHT_READY` prerequisite. Record the executable hash and stage any non-system UCRT64 runtime DLLs reported by `ldd` adjacent to the executable; do not install them. The host may truthfully be blocked because this is an unmodified-driver baseline.
+Accept host exit `0` or `1`; any other code is a probe failure. Parse the report and run the same invariant checks as the application test: schema `2`, no audio bytes, explicit requests always blocked, all three default roles and the linked WinRT IDs exact for a green result, and every other `ENDPOINT_PREFLIGHT_READY` prerequisite. Record the executable hash and stage any non-system UCRT64 runtime DLLs reported by `ldd` adjacent to the executable; do not install them. The host may truthfully be blocked because this is an unmodified-driver baseline.
 
 - [ ] **Step 6: Run the identical executable on the laptop without installing it**
 
 First verify the laptop SSH host key still matches `SHA256:ERhoPppZFQUtqJqRQv7ARDLNnL3HQiOMvHeDs01NA7o`. Once the host public key is authorized for `matt`, use `192.168.0.22` and fall back to `192.168.0.23` only if Ethernet is unreachable. Copy the executable and only its adjacent runtime DLL closure to a newly created `%TEMP%\vibepollo-atmos-probe` directory, execute it there, and retrieve JSON; do not install or register anything.
 
-Compute SHA-256 on both machines and require the laptop executable hash to equal the recorded host hash. Run default eConsole first. If it is not the intended physical HDMI endpoint, choose only an exact ID from `active_render_endpoints` whose canonical form-factor status is `DISPLAY_AUDIO` and connector status is `HDMI`, then rerun with `--endpoint-id`. Never select from friendly-name text alone. Preserve the process exit code and both JSON reports.
+Compute SHA-256 on both machines and require the laptop executable hash to equal the recorded host hash. Run default eConsole first. If it is not the intended physical HDMI endpoint, an exact ID from `active_render_endpoints` may be rerun with `--endpoint-id` for Core Audio diagnostics only; explicit selection cannot pass the spatial gate in this slice. Never select from friendly-name text alone. Preserve the process exit code and both JSON reports.
 
 Laptop endpoint-preflight acceptance is:
 
 ```text
 process exit == 0
 gate.verdict == ENDPOINT_PREFLIGHT_READY
-selection.requested_endpoint_id == selected_endpoint.id when explicit
-gate.selected_profile == MAT21 or MAT20 and is present in gate.ready_profiles
+selection.kind == default:eConsole
+all three default_render_endpoints IDs equal selected_endpoint.id
+gate.selected_profile == MAT21, MAT20, or MAT10 and is present in gate.ready_profiles
 selected_endpoint.state == active
 selected_endpoint.form_factor.status == DISPLAY_AUDIO
 selected_endpoint.jack_subtype.status == HDMI
 spatial_audio.active_format_guid == {A289735D-FA3E-4E35-9D7D-B6F896ACB2E7}
+spatial_audio.selected_endpoint_linked == true
+spatial_audio.link_source == winrt_default_and_communications
+spatial_audio.input_render_device_id is nonempty
+spatial_audio.returned_render_device_id == spatial_audio.input_render_device_id
 the selected MAT profile has format support == 0x00000000 and Initialize == 0x00000000
 audio_bytes_written == false
 laptop executable SHA-256 == host executable SHA-256
@@ -722,11 +762,11 @@ This subsystem is complete only when:
 
 - the portable truth table enforces exact active-format, canonical HDMI, and independent MAT-profile behavior;
 - the property-decoder regressions accept only Microsoft's authoritative HDMI GUID and reject DisplayPort, both former bad literals, missing/wrong-type/malformed values, and other GUIDs;
-- the descriptor test proves every Microsoft MAT20/MAT21 field and the 52-byte layout;
-- the coordinator test proves explicit endpoint ID reaches the provider and exact selected ID/report, and all exit codes/invariants are enforced;
+- the descriptor test proves every Microsoft MAT10/MAT20/MAT21 field and the 52-byte layout;
+- the coordinator tests prove the default route alone can become ready, an explicit endpoint ID reaches the provider but remains blocked without documented linkage, and all exit codes/invariants are enforced;
 - the structural adapter boundary, full-source audit, and independent review find no renderer service, audio buffer, payload write, or stream start path;
 - host JSON is captured as the unmodified-driver baseline;
 - the byte-identical executable runs on the laptop's selected physical HDMI route;
-- the laptop report is `ENDPOINT_PREFLIGHT_READY` for at least one exact MAT profile, or its precise `BLOCKED` diagnostic and exit `1` are retained as the stop condition;
+- the laptop report is `ENDPOINT_PREFLIGHT_READY` for at least one exact MAT profile with a proven WinRT render-device link, or its precise `BLOCKED` diagnostic and exit `1` are retained as the stop condition;
 - no driver, boot-policy, service, live Vibepollo, or Windows spatial-setting mutation occurred;
 - even after `ENDPOINT_PREFLIGHT_READY`, no driver/test-signing stage begins until a separate legal OS-generated spatial stream makes the real TV/eARC/soundbar receiver report Atmos lock on that route.

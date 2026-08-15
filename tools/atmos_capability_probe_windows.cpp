@@ -7,6 +7,7 @@
 #include <Audioclient.h>
 #include <mmdeviceapi.h>
 #include <winrt/Windows.Media.Audio.h>
+#include <winrt/Windows.Media.Devices.h>
 
 #include <array>
 #include <limits>
@@ -106,6 +107,30 @@ namespace {
   using audio_client_t = util::safe_ptr<IAudioClient, release_com<IAudioClient>>;
   using wstring_t = util::safe_ptr<WCHAR, co_task_free<WCHAR>>;
 
+  struct role_spec {
+    const char *name;
+    ERole role;
+  };
+
+  constexpr std::array k_default_render_roles {
+    role_spec {"console", eConsole},
+    role_spec {"multimedia", eMultimedia},
+    role_spec {"communications", eCommunications},
+  };
+
+  struct winrt_default_render_ids {
+    winrt::hstring default_render_id;
+    winrt::hstring communications_render_id;
+  };
+
+  std::array<atmos_probe::role_endpoint_observation, 3> make_default_endpoint_slots() {
+    std::array<atmos_probe::role_endpoint_observation, 3> endpoints {};
+    for (std::size_t index = 0; index < k_default_render_roles.size(); ++index) {
+      endpoints[index].role = k_default_render_roles[index].name;
+    }
+    return endpoints;
+  }
+
   class prop_variant_t {
   public:
     prop_variant_t() {
@@ -130,6 +155,41 @@ namespace {
       .operation = std::move(operation),
       .hresult = static_cast<atmos_probe::hresult_code>(hresult),
     });
+  }
+
+  std::optional<winrt_default_render_ids> observe_winrt_default_render_ids(
+    atmos_probe::probe_observation &observation,
+    const std::string_view bookend) {
+    using winrt::Windows::Media::Devices::AudioDeviceRole;
+    using winrt::Windows::Media::Devices::MediaDevice;
+
+    winrt_default_render_ids ids {};
+    bool sampled = true;
+    try {
+      ids.default_render_id = MediaDevice::GetDefaultAudioRenderId(AudioDeviceRole::Default);
+    } catch (const winrt::hresult_error &error) {
+      append_error(
+        observation,
+        "MediaDevice::GetDefaultAudioRenderId[" + std::string {bookend} + ",Default]",
+        error.code());
+      sampled = false;
+    }
+
+    try {
+      ids.communications_render_id =
+        MediaDevice::GetDefaultAudioRenderId(AudioDeviceRole::Communications);
+    } catch (const winrt::hresult_error &error) {
+      append_error(
+        observation,
+        "MediaDevice::GetDefaultAudioRenderId[" + std::string {bookend} +
+          ",Communications]",
+        error.code());
+      sampled = false;
+    }
+    if (!sampled) {
+      return std::nullopt;
+    }
+    return ids;
   }
 
   atmos_probe::endpoint_observation observe_endpoint(
@@ -230,22 +290,11 @@ namespace {
   void observe_role_defaults(
     IMMDeviceEnumerator *enumerator,
     atmos_probe::probe_observation &observation) {
-    struct role_spec {
-      const char *name;
-      ERole role;
-    };
-    constexpr std::array roles {
-      role_spec {"console", eConsole},
-      role_spec {"multimedia", eMultimedia},
-      role_spec {"communications", eCommunications},
-    };
-
-    for (std::size_t index = 0; index < roles.size(); ++index) {
-      observation.default_endpoints[index].role = roles[index].name;
+    for (std::size_t index = 0; index < k_default_render_roles.size(); ++index) {
       device_t device;
       const HRESULT hresult = enumerator->GetDefaultAudioEndpoint(
         eRender,
-        roles[index].role,
+        k_default_render_roles[index].role,
         &device);
       if (hresult == E_NOTFOUND) {
         continue;
@@ -254,15 +303,64 @@ namespace {
         append_error(
           observation,
           "IMMDeviceEnumerator::GetDefaultAudioEndpoint[" +
-            std::string {roles[index].name} + "]",
+            std::string {k_default_render_roles[index].name} + "]",
           hresult);
         continue;
       }
       observation.default_endpoints[index].endpoint = observe_endpoint(
         device.get(),
         observation,
-        "default_endpoints[" + std::string {roles[index].name} + "]");
+        "default_endpoints[" + std::string {k_default_render_roles[index].name} + "]");
     }
+  }
+
+  bool observe_final_role_default_ids(
+    IMMDeviceEnumerator *enumerator,
+    std::array<atmos_probe::role_endpoint_observation, 3> &default_endpoints,
+    atmos_probe::probe_observation &observation) {
+    bool sampled = true;
+    for (std::size_t index = 0; index < k_default_render_roles.size(); ++index) {
+      const auto &role = k_default_render_roles[index];
+      device_t device;
+      HRESULT hresult = enumerator->GetDefaultAudioEndpoint(eRender, role.role, &device);
+      if (hresult == E_NOTFOUND) {
+        continue;
+      }
+      if (FAILED(hresult) || !device) {
+        append_error(
+          observation,
+          "IMMDeviceEnumerator::GetDefaultAudioEndpoint[final," +
+            std::string {role.name} + "]",
+          FAILED(hresult) ? hresult : E_FAIL);
+        sampled = false;
+        continue;
+      }
+
+      wstring_t endpoint_id;
+      hresult = device->GetId(&endpoint_id);
+      if (FAILED(hresult) || !endpoint_id) {
+        append_error(
+          observation,
+          "final_default_endpoints[" + std::string {role.name} + "].GetId",
+          FAILED(hresult) ? hresult : E_FAIL);
+        sampled = false;
+        continue;
+      }
+
+      auto endpoint_id_utf8 = wide_to_utf8(endpoint_id.get());
+      if (endpoint_id_utf8.empty()) {
+        append_error(
+          observation,
+          "final_default_endpoints[" + std::string {role.name} + "].GetId",
+          E_FAIL);
+        sampled = false;
+        continue;
+      }
+      default_endpoints[index].endpoint = atmos_probe::endpoint_observation {
+        .id = std::move(endpoint_id_utf8),
+      };
+    }
+    return sampled;
   }
 
   device_t select_endpoint(
@@ -298,15 +396,31 @@ namespace {
   }
 
   void observe_spatial_audio(
-    const atmos_probe::endpoint_observation &endpoint,
+    const atmos_probe::probe_options &options,
+    const std::optional<winrt_default_render_ids> &initial_render_ids,
     atmos_probe::probe_observation &observation) {
     using winrt::Windows::Media::Audio::SpatialAudioDeviceConfiguration;
     using winrt::Windows::Media::Audio::SpatialAudioFormatSubtype;
 
+    if (options.endpoint_id || !initial_render_ids ||
+        !atmos_probe::all_default_roles_match_selected_endpoint(
+          observation.selected_endpoint,
+          observation.default_endpoints)) {
+      return;
+    }
+
+    const auto &default_render_id = initial_render_ids->default_render_id;
+    if (default_render_id.empty() ||
+        default_render_id != initial_render_ids->communications_render_id) {
+      return;
+    }
+
+    observation.spatial.input_render_device_id = winrt::to_string(default_render_id);
+
     SpatialAudioDeviceConfiguration configuration {nullptr};
     try {
       configuration = SpatialAudioDeviceConfiguration::GetForDeviceId(
-        winrt::to_hstring(endpoint.id));
+        default_render_id);
     } catch (const winrt::hresult_error &error) {
       append_error(
         observation,
@@ -317,7 +431,18 @@ namespace {
     if (!configuration) {
       return;
     }
-    observation.spatial.configuration_available = true;
+
+    try {
+      observation.spatial.returned_render_device_id =
+        winrt::to_string(configuration.DeviceId());
+      observation.spatial.configuration_available = true;
+    } catch (const winrt::hresult_error &error) {
+      append_error(
+        observation,
+        "SpatialAudioDeviceConfiguration::DeviceId",
+        error.code());
+      return;
+    }
 
     try {
       observation.spatial.spatial_audio_supported =
@@ -436,9 +561,17 @@ namespace atmos_probe {
     format.FormatExt.Format.cbSize = 34;
     format.FormatExt.Samples.wValidBitsPerSample = 16;
     format.FormatExt.dwChannelMask = KSAUDIO_SPEAKER_7POINT1;
-    format.FormatExt.SubFormat = profile == mat_profile::mat21 ?
-                                 k_iec61937_dolby_mat21 :
-                                 k_iec61937_dolby_mat20;
+    switch (profile) {
+      case mat_profile::mat21:
+        format.FormatExt.SubFormat = k_iec61937_dolby_mat21;
+        break;
+      case mat_profile::mat20:
+        format.FormatExt.SubFormat = k_iec61937_dolby_mat20;
+        break;
+      case mat_profile::mat10:
+        format.FormatExt.SubFormat = k_iec61937_dolby_mlp;
+        break;
+    }
     format.dwEncodedSamplesPerSec = 96000;
     format.dwEncodedChannelCount = 8;
     format.dwAverageBytesPerSec = 0;
@@ -494,11 +627,7 @@ namespace atmos_probe {
 
   probe_observation collect_windows_observation(const probe_options &options) {
     probe_observation observation {};
-    observation.default_endpoints = {
-      role_endpoint_observation {.role = "console"},
-      role_endpoint_observation {.role = "multimedia"},
-      role_endpoint_observation {.role = "communications"},
-    };
+    observation.default_endpoints = make_default_endpoint_slots();
 
     device_enumerator_t enumerator;
     const HRESULT hresult = CoCreateInstance(
@@ -516,8 +645,11 @@ namespace atmos_probe {
       return observation;
     }
 
-    observe_active_endpoints(enumerator.get(), observation);
     observe_role_defaults(enumerator.get(), observation);
+    const auto initial_render_ids = options.endpoint_id ?
+      std::optional<winrt_default_render_ids> {} :
+      observe_winrt_default_render_ids(observation, "initial");
+    observe_active_endpoints(enumerator.get(), observation);
 
     auto selected_device = select_endpoint(enumerator.get(), options, observation);
     if (!selected_device) {
@@ -528,7 +660,7 @@ namespace atmos_probe {
       selected_device.get(),
       observation,
       "selected_endpoint");
-    observe_spatial_audio(*observation.selected_endpoint, observation);
+    observe_spatial_audio(options, initial_render_ids, observation);
     observe_mat_profile(
       selected_device.get(),
       mat_profile::mat21,
@@ -539,6 +671,38 @@ namespace atmos_probe {
       mat_profile::mat20,
       observation.mat20,
       observation);
+    observe_mat_profile(
+      selected_device.get(),
+      mat_profile::mat10,
+      observation.mat10,
+      observation);
+
+    if (!options.endpoint_id) {
+      auto final_default_endpoints = make_default_endpoint_slots();
+      const bool final_core_audio_sampled = observe_final_role_default_ids(
+        enumerator.get(),
+        final_default_endpoints,
+        observation);
+      const auto final_render_ids = observe_winrt_default_render_ids(observation, "final");
+      if (!final_core_audio_sampled || !final_render_ids) {
+        observation.spatial = {};
+        return observation;
+      }
+
+      if (initial_render_ids && atmos_probe::default_route_link_is_stable(
+            observation.selected_endpoint,
+            observation.default_endpoints,
+            final_default_endpoints,
+            winrt::to_string(initial_render_ids->default_render_id),
+            winrt::to_string(initial_render_ids->communications_render_id),
+            winrt::to_string(final_render_ids->default_render_id),
+            winrt::to_string(final_render_ids->communications_render_id))) {
+        observation.spatial.selected_endpoint_linked = true;
+        observation.spatial.link_source = "winrt_default_and_communications";
+      } else {
+        observation.spatial = {};
+      }
+    }
     return observation;
   }
 }  // namespace atmos_probe
