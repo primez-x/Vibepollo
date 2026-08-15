@@ -410,6 +410,14 @@ sunshine_register_component(NAME test_component_virtual_display_manifest TEST_SO
     INCLUDE_DIRECTORIES "${SUNSHINE_TEST_GENERATED_INCLUDE_DIR}")
 
 if(WIN32)
+    sunshine_register_component(
+        NAME test_component_atmos_capability_probe_windows
+        TEST_SOURCE unit/platform/windows/test_atmos_capability_probe_windows.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_capability_probe_windows.cpp"
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_capability_probe_policy.cpp"
+        LINK_LIBRARIES ole32 windowsapp ksuser
+    )
     sunshine_register_component(NAME test_component_playnite_protocol TEST_SOURCE test_playnite_protocol.cpp
         PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/playnite_protocol.cpp")
     foreach(_playnite_test IN ITEMS
