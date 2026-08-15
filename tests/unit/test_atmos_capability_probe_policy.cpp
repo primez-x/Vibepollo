@@ -329,6 +329,31 @@ TEST(AtmosCapabilityProbePolicy, RequiresExactSOkForMatFormatSupport) {
   );
 }
 
+// Catches a SUCCEEDED check that accepts S_FALSE as an exclusive-initialize success.
+TEST(AtmosCapabilityProbePolicy, RequiresExactSOkForMatInitialize) {
+  auto observation = ready_observation();
+  observation.mat20 = {
+    .format_support_hresult = std::nullopt,
+    .initialize_hresult = std::nullopt,
+  };
+  observation.mat21 = {
+    .format_support_hresult = 0,
+    .initialize_hresult = 1,
+  };
+
+  expect_gate_result(
+    atmos_probe::evaluate(observation),
+    false,
+    std::nullopt,
+    std::vector<mat_profile> {},
+    std::vector<diagnostic> {
+      diagnostic::mat20_exclusive_probe_failed,
+      diagnostic::mat21_exclusive_initialize_failed,
+      diagnostic::no_exclusive_mat_profile_ready,
+    }
+  );
+}
+
 // Catches an initialize-result branch that ignores AUDCLNT_E_DEVICE_IN_USE after S_OK support.
 TEST(AtmosCapabilityProbePolicy, ReportsMat21ExclusiveInitializeFailure) {
   auto observation = ready_observation();
