@@ -117,6 +117,10 @@ namespace audio::policy {
     );
   }
 
+  int sink_assignment_result(bool assignment_active, int role_failures) {
+    return assignment_active ? role_failures : -1;
+  }
+
   sample_action_e sample_action(sample_status_e status) {
     switch (status) {
       case sample_status_e::ok:
