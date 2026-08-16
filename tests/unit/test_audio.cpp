@@ -100,6 +100,34 @@ TEST(AudioEndpointRestorePolicy, IncompleteCatalogFailsClosed) {
   EXPECT_EQ(select_eligible_non_steam_render_endpoint(catalog, {"realtek"}), std::nullopt);
 }
 
+TEST(AudioEndpointRestorePolicy, PlansHostMuteVisibilityAndHidesSteamOnTeardown) {
+  const auto plan = plan_host_mute_visibility(true, {
+    {"realtek", "Realtek USB Audio", true},
+    {"hdmi", "NVIDIA High Definition Audio", true},
+    {"steam-speakers", "Steam Streaming Speakers", true},
+    {"steam-microphone", "Steam Streaming Microphone", false},
+  }, {"steam-speakers", "steam-microphone"});
+
+  ASSERT_TRUE(plan.has_value());
+  EXPECT_EQ(plan->show_on_connect, std::vector<std::string>({"steam-microphone"}));
+  EXPECT_EQ(plan->hide_on_connect, std::vector<std::string>({"realtek", "hdmi"}));
+  EXPECT_EQ(
+    plan->hide_on_teardown,
+    std::vector<std::string>({"steam-speakers", "steam-microphone"})
+  );
+  EXPECT_EQ(plan->show_on_teardown, std::vector<std::string>({"realtek", "hdmi"}));
+}
+
+TEST(AudioEndpointRestorePolicy, HostMuteVisibilityFailsClosedOnIncompleteOrMissingVirtualState) {
+  const std::vector<render_endpoint_t> endpoints {
+    {"realtek", "Realtek USB Audio", true},
+    {"steam-speakers", "Steam Streaming Speakers", true},
+  };
+
+  EXPECT_FALSE(plan_host_mute_visibility(false, endpoints, {"steam-speakers"}).has_value());
+  EXPECT_FALSE(plan_host_mute_visibility(true, endpoints, {"steam-speakers", "steam-microphone"}).has_value());
+}
+
 namespace {
   class fake_source_t: public sample_source_t {
   public:

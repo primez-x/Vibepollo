@@ -117,6 +117,55 @@ namespace audio::policy {
     );
   }
 
+  std::optional<host_mute_visibility_plan_t> plan_host_mute_visibility(
+    bool discovery_complete,
+    const std::vector<render_endpoint_t> &endpoints,
+    const std::vector<std::string> &virtual_ids
+  ) {
+    if (!discovery_complete || virtual_ids.empty()) {
+      return std::nullopt;
+    }
+
+    host_mute_visibility_plan_t plan;
+    for (std::size_t index = 0; index < virtual_ids.size(); ++index) {
+      const auto &virtual_id = virtual_ids[index];
+      if (virtual_id.empty()) {
+        return std::nullopt;
+      }
+      if (std::find(virtual_ids.begin(), virtual_ids.begin() + index, virtual_id) !=
+          virtual_ids.begin() + index) {
+        return std::nullopt;
+      }
+
+      const auto endpoint = std::find_if(
+        endpoints.begin(),
+        endpoints.end(),
+        [&](const render_endpoint_t &candidate) { return candidate.id == virtual_id; }
+      );
+      if (endpoint == endpoints.end() || endpoint->adapter_name.empty()) {
+        return std::nullopt;
+      }
+      if (!endpoint->active) {
+        plan.show_on_connect.push_back(virtual_id);
+      }
+      plan.hide_on_teardown.push_back(virtual_id);
+    }
+
+    for (const auto &endpoint : endpoints) {
+      if (endpoint.id.empty() || endpoint.adapter_name.empty()) {
+        return std::nullopt;
+      }
+      if (!endpoint.active ||
+          std::find(virtual_ids.begin(), virtual_ids.end(), endpoint.id) != virtual_ids.end()) {
+        continue;
+      }
+      plan.hide_on_connect.push_back(endpoint.id);
+      plan.show_on_teardown.push_back(endpoint.id);
+    }
+
+    return plan;
+  }
+
   int sink_assignment_result(bool assignment_active, int role_failures) {
     return assignment_active ? role_failures : -1;
   }
