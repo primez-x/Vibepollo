@@ -47,6 +47,12 @@ TEST(AudioSinkPolicy, PreservesPriorityAndEmptyFallbacks) {
   EXPECT_TRUE(select_sink(no_virtual, "", 2, false).empty());
 }
 
+TEST(AudioSinkPolicy, FailsClosedWhenVirtualSinkActivationStopsEarly) {
+  EXPECT_EQ(sink_assignment_result(false, 0), -1);
+  EXPECT_EQ(sink_assignment_result(true, 0), 0);
+  EXPECT_EQ(sink_assignment_result(true, 2), 2);
+}
+
 TEST(AudioEndpointRestorePolicy, ExcludesBothSteamRenderAdapters) {
   const std::vector<render_endpoint_t> endpoints {
     {"steam-speakers", "Steam Streaming Speakers", true},

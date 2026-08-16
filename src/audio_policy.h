@@ -61,6 +61,8 @@ namespace audio::policy {
     const std::vector<std::string> &preferred_ids
   );
 
+  int sink_assignment_result(bool assignment_active, int role_failures);
+
   enum class sample_status_e {
     ok,
     timeout,

@@ -1100,7 +1100,7 @@ namespace platf::audio {
         }
       }
 
-      return failure;
+      return ::audio::policy::sink_assignment_result(assignment_active, failure);
     }
 
     int restore_sink(const std::string &) override {
