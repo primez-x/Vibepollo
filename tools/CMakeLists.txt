@@ -65,6 +65,33 @@ target_link_libraries(atmos-capability-probe
 )
 target_compile_options(atmos-capability-probe PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
+add_executable(atmos-pcm-spatial-probe
+        atmos_pcm_spatial_probe.cpp
+        atmos_pcm_spatial_probe_main.cpp
+        atmos_pcm_spatial_probe_windows.cpp)
+target_link_libraries(atmos-pcm-spatial-probe
+        nlohmann_json::nlohmann_json
+        ole32
+        mmdevapi
+        ${PLATFORM_LIBRARIES}
+)
+target_compile_options(atmos-pcm-spatial-probe PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+# Read-only discovery for NVIDIA's installed signed virtual-audio capture ABI.
+# The probe calls only the public factory export and never registers an endpoint
+# or starts capture; the production integration can gate on the exact returned
+# interface version before invoking any session method.
+add_executable(nvidia-nvaudcap-probe
+        nvidia_nvaudcap_probe.cpp
+        nvidia_nvaudcap_probe_main.cpp
+        nvidia_nvaudcap_probe_windows.cpp)
+target_link_libraries(nvidia-nvaudcap-probe
+        nlohmann_json::nlohmann_json
+        version
+        wintrust
+        ${PLATFORM_LIBRARIES})
+target_compile_options(nvidia-nvaudcap-probe PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
 add_executable(atmos-spatial-lock-test
         atmos_spatial_lock_test.cpp
         atmos_spatial_lock_test_windows.cpp)

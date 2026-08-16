@@ -5,13 +5,19 @@
 **Primary upstream:** [Nonary/Vibepollo](https://github.com/Nonary/Vibepollo)  
 **Client upstreams:** [Nonary/moonlight-qt](https://github.com/Nonary/moonlight-qt) and [Nonary/moonlight-common-c](https://github.com/Nonary/moonlight-common-c)
 
-**Current implementation status (2026-08-16):** Stages 1 and 2 are complete at their stated evidence boundaries. Stage 1 has the no-write capability/spatial carrier-state evidence for the intended laptop HDMI route. Stage 2 has an independently GREEN, unsigned, isolated SysVAD MAT10 source/package snapshot at commit `6160f5a` (`primez-x/Windows-driver-samples`, branch `agent/atmos-mat-endpoint`): `Release|x64` build, native 116-byte/52-byte format validation, same-stream metadata/state reducer, rights/frontier/terminal concurrency tests, static and compiled mutation tests, INF/catalog/package verification, and read-only lifecycle fixtures all pass. The package was not signed, installed, loaded, or exercised against a live device. Steam/Realtek restoration code and focused tests are complete in the Vibepollo host tree, but transactional live deployment and controlled stream/teardown verification remain pending.
+**Current implementation status (2026-08-16):** Stages 1 and 2 are complete at their stated evidence boundaries. Stage 1 has the no-write capability/spatial carrier-state evidence for the intended laptop HDMI route. Stage 2 is GREEN and pushed at commit `98a0fc0` (`primez-x/Windows-driver-samples`, branch `agent/atmos-mat-endpoint`): the isolated MAT10 endpoint, same-binary read-only control device, bounded kernel payload ring, exact consumed-range publication, fixed record ABI, lifecycle/rights/frontier/terminal tests, WDK API validation, INF/catalog signability, and compiled state harness all pass. The package remains unsigned and was not installed or loaded. The Vibepollo host/client tree contains the matching record reader, TLS 1.3 relay framing, exclusive MAT10 client writer, capability probes, and focused tests. Steam/Realtek restoration is separately deployed and upstreamed; an end-to-end Atmos run now depends on publisher signing and packaging the driver.
 
-The current SysVAD implementation is metadata/state logic only. It does not yet include the kernel payload tap or control device, a capture ring, opaque payload handoff, packetization/FEC/AEAD/retransmission, a Moonlight client renderer/UI, clock recovery, or end-to-end Atmos transport. Sections and stages below that describe those components are future implementation contracts, not completed behavior. A soundbar `Atmos` badge or continuously present carrier indication remains route/carrier-state evidence only: it is not proof of native content provenance, a newly acquired receiver lock, or bit-exact relay.
+The signed-NVIDIA experiment was completed on 2026-08-16 and is not an exact-Atmos route on this host. NVIDIA's installed, signed `nvaudcap64v.dll` factory and 1.9 interface are usable from an ordinary process, and its NVVAD session endpoint can be registered and captured, but the matching signed DLL and kernel driver encode only one to eight channels of PCM. A live 8-channel endpoint succeeded; 12-channel PCM and MAT 1.0/2.0/2.1 were rejected, and Windows reported Dolby Atmos for Home Theater unsupported. NVIDIA's official `NvAPI_GPU_SetEDID` software-forced-EDID API was also exercised against an unused RTX 5090 output with the client's freshly acquired EDID and returned `NVAPI_NOT_SUPPORTED`, matching NVIDIA's documented GeForce exclusion. The endpoint and all three default roles were then restored and verified.
+
+The primary exact-Atmos route is therefore the isolated SysVAD MAT endpoint plus the existing host relay and client exclusive writer, with the driver package signed and published by Vibepollo's driver publisher. Secure Boot remains enabled; no unsigned package is installed on the target host. The NVIDIA integration remains useful as a signed, low-latency PCM fallback and as a capability probe, but it must never label its 7.1 output as native Atmos. The captured `Beyond TV` EDID is a test fixture only; no EDID, endpoint ID, or receiver identity may be compiled into Vibepollo or used as a production default.
+
+A soundbar `Atmos` badge or continuously present carrier indication remains route/carrier-state evidence only: it is not proof of native content provenance, a newly acquired receiver lock, or bit-exact relay.
 
 ## Decision
 
-Add an experimental, backwards-compatible opaque IEC 61937 Dolby MAT path beside the existing GameStream Opus path. Windows Spatial Sound and Dolby Access render game beds and dynamic objects into MAT on a virtual HDMI endpoint on the host. Vibepollo transports those bytes without decoding, remixing, resampling, or changing volume. A paired Windows Moonlight client writes the recovered carrier to an Atmos-capable HDMI endpoint in WASAPI exclusive mode.
+Add an experimental, backwards-compatible opaque MAT path beside the existing GameStream Opus path. The paired client discovers its currently selected physical HDMI/eARC sink and sends a validated live capability result over the authenticated control channel. When both peers commit MAT10, Windows Spatial Sound and Dolby Access render to the publisher-signed host MAT endpoint, Vibepollo reads exact consumed carrier ranges from the endpoint's bounded tap, and the client writes those bytes unchanged to its selected HDMI endpoint in exclusive mode.
+
+The negotiated order is: exact MAT10 through the publisher-signed endpoint; signed NVIDIA 7.1 PCM as an explicitly non-native fallback; then existing Opus stereo/5.1/7.1. A registered endpoint, successful shared-mode open, or soundbar badge alone never proves exact MAT or native-object provenance.
 
 Atmos is available to the user only when both peers pass explicit capability checks. A pre-launch failure leaves the session on the existing stereo/5.1/7.1 Opus path. After an opaque epoch is committed, a route or transport failure stops opaque audio while preserving video/input; version 1 never changes the live stream back to Opus without a new session.
 
@@ -21,6 +27,7 @@ This is not a 12-channel extension to Opus. Dolby MAT's eight 192 kHz carrier la
 
 - Preserve the host OS's Dolby Atmos for Home Theater output through a Windows laptop's HDMI/eARC path to a TV and soundbar.
 - Preserve static 7.1.4 beds and dynamic-object metadata by relaying the MAT carrier bit-for-bit.
+- Discover and proxy the active client's sink EDID per session; never hardcode a receiver EDID.
 - Expose Atmos in the client only when the selected physical output path is currently capable and configured for it.
 - Keep unmodified Vibepollo and Moonlight peers fully interoperable through the existing Opus path.
 - Detect endpoint changes and fail safely without emitting arbitrary or malformed carrier bytes.
@@ -33,6 +40,9 @@ This is not a 12-channel extension to Opus. Dolby MAT's eight 192 kHz carrier la
 - Supporting protected or DRM-restricted playback.
 - Claiming compatibility with Atmos for Headphones, Windows Sonic, or DTS spatial formats.
 - Inferring capability from an EDID name, channel count, Dolby Access installation, or a receiver badge alone.
+- Shipping a captured client EDID, endpoint ID, or receiver identity as a built-in default.
+- Adding an external HDMI capture, forwarding, EDID-emulation, or AV-over-IP device.
+- Modifying or replacing NVIDIA's signed driver, INF, catalog, or system DLL.
 - Shipping public Dolby branding or a redistributable driver package before licensing and trademark review.
 - Replacing the existing Opus audio implementation for normal sessions.
 
@@ -67,6 +77,20 @@ The driver source must not be copied into the Vibepollo repository. A future hos
 ## End-to-end flow
 
 ```text
+Rejected signed-NVIDIA exact route (retained as PCM fallback only):
+
+Client active HDMI/eARC sink -> validated live EDID + capability offer
+        |
+        v
+Vibepollo session + NVIDIA NVVAD endpoint (maximum 8-channel PCM)
+        |
+        v
+No MAT/Atmos endpoint exposed on the tested signed stack
+        |
+        `--> exact 7.1 PCM fallback -> existing/authenticated Vibepollo audio path
+
+Publisher-signed exact-MAT route:
+
 Game / Windows spatial API
         |
         v
@@ -94,6 +118,22 @@ Laptop HDMI -> TCL TV/eARC -> Atmos-capable soundbar
 ```
 
 ## Capability contract
+
+### Dynamic sink-EDID probe contract (signed-NVIDIA experiment and test fixtures)
+
+The EDID is session data, not configuration. The client obtains it from the monitor interface associated with the exact currently selected HDMI/eARC render route during discovery and repeats the acquisition immediately before commit. A saved EDID may be used only as an automated-test fixture or a manually identified bench-programming artifact.
+
+Before offering the route, the client must:
+
+1. require the EDID base header, a byte length exactly equal to `(1 + extension_count) * 128`, and no more than the 255 extension blocks (256 total blocks) representable by the base descriptor;
+2. verify the checksum of every 128-byte block and parse CTA/DisplayID bounds without trusting display names or free-form strings;
+3. bind the EDID bytes and SHA-256 to the exact client render endpoint, monitor interface, active Atmos format, and route bookends;
+4. send those values only inside the authenticated paired-session control channel; and
+5. invalidate the offer on endpoint change, monitor hot-plug, EDID hash change, sleep/resume, active-spatial-format change, or default-route change.
+
+The host validates the descriptor again before any NVIDIA experiment. The tested GeForce driver cannot accept a forced EDID through the official API and NVVAD cannot expose MAT, so production exact-MAT negotiation does not depend on host EDID injection. A future signed-driver implementation may only revive this path after the exact client EDID is applied and read back byte-for-byte and the resulting endpoint independently passes MAT format initialization. A mismatch, stale route, unsupported audio block, NVIDIA API/version mismatch, endpoint registration failure, or unavailable signed stack selects the stored fallback before launch.
+
+The EDID contract never authorizes arbitrary registry edits, a bundled receiver descriptor, direct NVIDIA driver/INF modification, or unchecked bytes passed into a kernel component. On teardown Vibepollo releases the session-specific NVIDIA endpoint and virtual-display binding and restores the exact pre-session audio defaults; it does not rewrite the client's sink EDID.
 
 ### Client discovery gate (future client implementation; Stage-1 probe evidence only)
 

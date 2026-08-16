@@ -516,6 +516,21 @@ if(WIN32)
             "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_capability_probe_policy.cpp"
         LINK_LIBRARIES ole32 windowsapp ksuser
     )
+    sunshine_register_component(
+        NAME test_component_atmos_pcm_spatial_probe
+        TEST_SOURCE unit/platform/windows/test_atmos_pcm_spatial_probe.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_pcm_spatial_probe.cpp"
+        DEFINITIONS "SUNSHINE_SOURCE_DIR=\"${SUNSHINE_TEST_REPOSITORY_ROOT}\""
+        LINK_LIBRARIES ole32 mmdevapi
+    )
+    sunshine_register_component(
+        NAME test_component_nvidia_nvaudcap_probe
+        TEST_SOURCE unit/platform/windows/test_nvidia_nvaudcap_probe.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/nvidia_nvaudcap_probe.cpp"
+        LINK_LIBRARIES nlohmann_json::nlohmann_json
+    )
     sunshine_register_component(NAME test_component_playnite_protocol TEST_SOURCE test_playnite_protocol.cpp
         PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/playnite_protocol.cpp")
     foreach(_playnite_test IN ITEMS
