@@ -65,7 +65,7 @@ const std::wstring service_executable = L"C:\\Program Files\\Apollo\\tools\\suns
 const std::wstring service_command = L"\"C:\\Program Files\\Apollo\\tools\\sunshinesvc.exe\" --service";
 const std::wstring transaction_root = L"C:\\Program Files\\Apollo\\.vibepollo-audio-hotfix";
 const std::wstring global_mutex_name = L"Global\\VibepolloAudioHotfixDeployer";
-constexpr char expected_original_hash_hex[] = "bf7e4a39a3957e7567484bce245cdd067db39a6c52e63b0e3e87f4d89e5eda4a";
+constexpr char expected_original_hash_hex[] = "6263a8d22ece09b9623c18912994d54680a6c439290a691ba95b6f266b63801f";
 #endif
 constexpr std::uint64_t maximum_artifact_bytes = 512ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t safety_margin_bytes = 64ULL * 1024ULL * 1024ULL;
