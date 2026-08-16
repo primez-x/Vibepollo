@@ -867,7 +867,7 @@ namespace platf::audio {
       }
 
       // Search for the virtual audio sink device currently present in the system.
-      auto matched = find_device_id(match_list);
+      auto matched = find_device_id(match_list, DEVICE_STATEMASK_ALL);
       if (matched) {
         // Prepare to fill virtual audio sink names with device_id.
         auto device_id = utf_utils::to_utf8(matched->second);
@@ -1007,8 +1007,26 @@ namespace platf::audio {
     }
 
     int set_sink(const std::string &sink) override {
+      return set_sink(sink, host_mute_requested_);
+    }
+
+    int set_sink(const std::string &sink, bool mute_host) override {
+      host_mute_requested_ = mute_host;
+      if (host_mute_prepared_ && !host_mute_active_ && !rollback_host_mute_visibility()) {
+        BOOST_LOG(error) << "Previous host-audio mute visibility rollback is incomplete"sv;
+        return -1;
+      }
+      const bool starting_host_mute = mute_host && !host_mute_active_ && !host_mute_prepared_;
+      if (starting_host_mute && !prepare_host_mute_visibility()) {
+        BOOST_LOG(error) << "Couldn't establish the host-audio mute endpoint visibility transaction"sv;
+        return -1;
+      }
+
       auto device_id = set_format(sink);
       if (!device_id) {
+        if (starting_host_mute) {
+          (void) rollback_host_mute_visibility();
+        }
         return -1;
       }
 
@@ -1045,6 +1063,14 @@ namespace platf::audio {
         for (const auto &role_restore : transferred_role_restores) {
           const auto index = role_index(role_restore.role);
           captured_default_device_ids[index] = role_restore.preferred_id;
+        }
+
+        for (int x = 0; x < static_cast<int>(ERole_enum_count); ++x) {
+          if (!captured_default_device_ids[static_cast<std::size_t>(x)].empty()) {
+            BOOST_LOG(info) << "Captured pre-stream default endpoint for role ["sv << x
+                            << "]: "sv
+                            << utf_utils::to_utf8(captured_default_device_ids[static_cast<std::size_t>(x)].c_str());
+          }
         }
 
         assigned_device_id = *device_id;
@@ -1091,6 +1117,24 @@ namespace platf::audio {
         );
       }
 
+      if (!assignment_active || failure) {
+        if (starting_host_mute) {
+          // The assignment may have partially changed role defaults. Reuse
+          // the normal role-scoped restore path before restoring visibility.
+          (void) restore_sink(sink);
+          assigned_device_id.clear();
+          assigned_sink.clear();
+        }
+        return ::audio::policy::sink_assignment_result(assignment_active, failure);
+      }
+
+      if (starting_host_mute && !commit_host_mute_visibility()) {
+        (void) restore_sink(sink);
+        assigned_device_id.clear();
+        assigned_sink.clear();
+        return -1;
+      }
+
       // Remember the assigned sink name, so we have it for later if we need to set it
       // back after another application changes it
       if (assignment_active && !failure) {
@@ -1108,6 +1152,10 @@ namespace platf::audio {
       // the captured role defaults. Publish every intended role before the
       // calls so an older in-flight worker can repair to this assignment.
       const auto current_default_ids = current_default_device_ids();
+      const bool visibility_restored = teardown_host_mute_visibility();
+      if (!visibility_restored) {
+        BOOST_LOG(warning) << "Host-audio mute endpoint visibility teardown was incomplete"sv;
+      }
       auto desired_device_ids = current_default_ids;
       for (int x = 0; x < static_cast<int>(ERole_enum_count); ++x) {
         const auto role = static_cast<ERole>(x);
@@ -1152,7 +1200,7 @@ namespace platf::audio {
         }
       }
 
-      return failure;
+      return failure || (visibility_restored ? 0 : 1);
     }
 
     enum class match_field_e {
@@ -1439,13 +1487,16 @@ namespace platf::audio {
      * @param match_list Pairs of match fields and values
      * @return Optional pair of matched field and device_id
      */
-    std::optional<matched_field_t> find_device_id(const match_fields_list_t &match_list) {
+    std::optional<matched_field_t> find_device_id(
+      const match_fields_list_t &match_list,
+      DWORD state_mask = DEVICE_STATE_ACTIVE
+    ) {
       if (match_list.empty()) {
         return std::nullopt;
       }
 
       collection_t collection;
-      auto status = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+      auto status = device_enum->EnumAudioEndpoints(eRender, state_mask, &collection);
       if (FAILED(status)) {
         BOOST_LOG(error) << "Couldn't enumerate: [0x"sv << util::hex(status).to_string_view() << ']';
         return std::nullopt;
@@ -1544,6 +1595,185 @@ namespace platf::audio {
     }
 
   private:
+    using render_endpoint_states_t = std::vector<::audio::policy::render_endpoint_t>;
+
+    std::optional<render_endpoint_states_t> render_endpoint_visibility_snapshot() {
+      collection_t collection;
+      const auto status = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATEMASK_ALL, &collection);
+      if (FAILED(status) || !collection) {
+        BOOST_LOG(error) << "Couldn't enumerate render endpoint visibility state: [0x"sv
+                         << util::hex(status).to_string_view() << ']';
+        return std::nullopt;
+      }
+
+      UINT count = 0;
+      if (FAILED(collection->GetCount(&count))) {
+        BOOST_LOG(error) << "Couldn't count render endpoint visibility state"sv;
+        return std::nullopt;
+      }
+
+      render_endpoint_states_t endpoints;
+      endpoints.reserve(count);
+      for (UINT index = 0; index < count; ++index) {
+        audio::device_t device;
+        if (FAILED(collection->Item(index, &device)) || !device) {
+          return std::nullopt;
+        }
+
+        audio::wstring_t device_id;
+        DWORD state = DEVICE_STATE_NOTPRESENT;
+        if (FAILED(device->GetId(&device_id)) || !device_id || FAILED(device->GetState(&state))) {
+          return std::nullopt;
+        }
+
+        audio::prop_t properties;
+        if (FAILED(device->OpenPropertyStore(STGM_READ, &properties)) || !properties) {
+          return std::nullopt;
+        }
+
+        prop_var_t adapter_friendly_name;
+        if (FAILED(properties->GetValue(PKEY_DeviceInterface_FriendlyName, &adapter_friendly_name.prop)) ||
+            adapter_friendly_name.prop.vt != VT_LPWSTR ||
+            !adapter_friendly_name.prop.pwszVal ||
+            adapter_friendly_name.prop.pwszVal[0] == L'\0') {
+          return std::nullopt;
+        }
+
+        endpoints.push_back({
+          utf_utils::to_utf8(device_id.get()),
+          utf_utils::to_utf8(adapter_friendly_name.prop.pwszVal),
+          state == DEVICE_STATE_ACTIVE,
+        });
+      }
+
+      return endpoints;
+    }
+
+    bool set_endpoint_visibility(const std::vector<std::string> &endpoint_ids, INT visible) {
+      bool success = true;
+      for (const auto &endpoint_id : endpoint_ids) {
+        if (endpoint_id.empty()) {
+          success = false;
+          continue;
+        }
+        const auto endpoint_id_wide = utf_utils::from_utf8(endpoint_id);
+        const auto status = policy->SetEndpointVisibility(endpoint_id_wide.c_str(), visible);
+        if (FAILED(status)) {
+          BOOST_LOG(warning) << "Couldn't set endpoint visibility for ["sv << endpoint_id
+                             << "] to ["sv << visible << "]: 0x"
+                             << util::hex(status).to_string_view();
+          success = false;
+        }
+      }
+      return success;
+    }
+
+    bool prepare_host_mute_visibility() {
+      const auto snapshot = render_endpoint_visibility_snapshot();
+      if (!snapshot) {
+        return false;
+      }
+
+      std::vector<std::string> virtual_ids;
+      bool has_speakers = false;
+      bool has_microphone = false;
+      for (const auto &endpoint : *snapshot) {
+        if (!::audio::policy::is_steam_streaming_render_adapter(endpoint.adapter_name)) {
+          continue;
+        }
+        virtual_ids.push_back(endpoint.id);
+        has_speakers = has_speakers || endpoint.adapter_name == "Steam Streaming Speakers";
+        has_microphone = has_microphone || endpoint.adapter_name == "Steam Streaming Microphone";
+      }
+
+      // Host mute owns both halves of the Steam topology. If either half is
+      // missing, fail closed instead of leaving a partially managed topology.
+      if (!has_speakers || !has_microphone) {
+        BOOST_LOG(error) << "Steam render pair is incomplete; refusing host-audio mute transition"sv;
+        return false;
+      }
+
+      const auto plan = ::audio::policy::plan_host_mute_visibility(true, *snapshot, virtual_ids);
+      if (!plan) {
+        return false;
+      }
+
+      host_mute_visibility_plan_ = *plan;
+      host_mute_prepared_ = true;
+      BOOST_LOG(info) << "Host-audio mute visibility plan: show Steam endpoints ["
+                      << host_mute_visibility_plan_.show_on_connect.size()
+                      << "], hide physical endpoints ["
+                      << host_mute_visibility_plan_.hide_on_connect.size() << "]"sv;
+      if (!set_endpoint_visibility(host_mute_visibility_plan_.show_on_connect, TRUE)) {
+        rollback_host_mute_visibility();
+        return false;
+      }
+      return true;
+    }
+
+    bool commit_host_mute_visibility() {
+      if (!host_mute_prepared_) {
+        return false;
+      }
+      if (!set_endpoint_visibility(host_mute_visibility_plan_.hide_on_connect, FALSE)) {
+        rollback_host_mute_visibility();
+        return false;
+      }
+      host_mute_active_ = true;
+      return true;
+    }
+
+    bool rollback_host_mute_visibility() {
+      if (!host_mute_prepared_) {
+        return true;
+      }
+      // Restore the exact pre-transition state: physical endpoints that were
+      // active become visible again, and Steam halves that were hidden remain
+      // hidden. Best-effort cleanup is still attempted for every endpoint.
+      const bool physical_visible = set_endpoint_visibility(
+        host_mute_visibility_plan_.hide_on_connect,
+        TRUE
+      );
+      const bool steam_restored = set_endpoint_visibility(
+        host_mute_visibility_plan_.show_on_connect,
+        FALSE
+      );
+      if (!physical_visible || !steam_restored) {
+        return false;
+      }
+
+      host_mute_visibility_plan_ = {};
+      host_mute_prepared_ = false;
+      host_mute_active_ = false;
+      return true;
+    }
+
+    bool teardown_host_mute_visibility() {
+      if (!host_mute_prepared_) {
+        return true;
+      }
+      if (!host_mute_active_) {
+        return rollback_host_mute_visibility();
+      }
+
+      const bool steam_hidden = set_endpoint_visibility(
+        host_mute_visibility_plan_.hide_on_teardown,
+        FALSE
+      );
+      const bool physical_visible = set_endpoint_visibility(
+        host_mute_visibility_plan_.show_on_teardown,
+        TRUE
+      );
+      if (!steam_hidden || !physical_visible) {
+        return false;
+      }
+
+      host_mute_visibility_plan_ = {};
+      host_mute_prepared_ = false;
+      host_mute_active_ = false;
+      return true;
+    }
+
     bool is_default_device(const std::wstring &device_id, ERole role = eConsole) {
       auto current_default_dev = default_device(device_enum, role);
       if (!current_default_dev) {
@@ -3189,7 +3419,22 @@ namespace platf::audio {
       return 0;
     }
 
-    ~audio_control_t() override = default;
+    ~audio_control_t() override {
+      // A policy write can fail transiently while the audio topology is being
+      // torn down. Keep the transaction owned until the inverse writes have
+      // succeeded, and make a few final retries while COM/policy are alive.
+      for (int attempt = 0; attempt < 3 && host_mute_prepared_; ++attempt) {
+        const bool cleaned = host_mute_active_ ?
+          teardown_host_mute_visibility() :
+          rollback_host_mute_visibility();
+        if (!cleaned) {
+          BOOST_LOG(warning) << "Retrying incomplete host-audio mute visibility cleanup"sv;
+        }
+      }
+      if (host_mute_prepared_) {
+        BOOST_LOG(error) << "Host-audio mute visibility cleanup remained incomplete at control destruction"sv;
+      }
+    }
 
     policy_t policy;
     audio::device_enum_t device_enum;
@@ -3197,6 +3442,10 @@ namespace platf::audio {
     pending_role_restore_handoff_t pending_role_restore_handoff;
     std::string assigned_sink;
     std::wstring assigned_device_id;
+    ::audio::policy::host_mute_visibility_plan_t host_mute_visibility_plan_;
+    bool host_mute_requested_ = false;
+    bool host_mute_prepared_ = false;
+    bool host_mute_active_ = false;
   };
 }  // namespace platf::audio
 
@@ -3216,7 +3465,8 @@ namespace platf {
 
     // Install Steam Streaming Speakers if needed. We do this during audio_control() to ensure
     // the sink information returned includes the new Steam Streaming Speakers device.
-    if (config::audio.install_steam_drivers && !control->find_device_id(control->match_steam_speakers())) {
+    if (config::audio.install_steam_drivers &&
+        !control->find_device_id(control->match_steam_speakers(), DEVICE_STATEMASK_ALL)) {
       // This is best effort. Don't fail if it doesn't work.
       control->install_steam_audio_drivers();
     }
