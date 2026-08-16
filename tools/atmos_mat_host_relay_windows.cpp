@@ -3,6 +3,7 @@
 #ifdef _WIN32
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 
 namespace atmos_mat_host {
@@ -20,9 +21,17 @@ namespace atmos_mat_host {
       std::uint32_t total_bytes; std::uint64_t driver_generation, stream_id, dropped_bytes, discontinuity_count, producer_cursor, consumer_cursor;
       std::uint32_t terminal_reason, reserved1;
     };
+    struct tap_caps {
+      std::uint32_t magic; std::uint16_t major, minor, header_bytes, reserved0;
+      std::uint32_t total_bytes; std::uint64_t driver_generation, stream_id;
+      std::uint32_t format_generation, format_bytes;
+      std::array<std::uint8_t, 52> format;
+      std::uint32_t flags, reserved1;
+    };
 #pragma pack(pop)
     static_assert(sizeof(tap_request) == 36);
     static_assert(sizeof(tap_status) == 72);
+    static_assert(sizeof(tap_caps) == 100);
     constexpr DWORD ioctl_vibe_mat_tap_query_caps = 0x00226000UL;
     constexpr DWORD ioctl_vibe_mat_tap_status = 0x00226004UL;
     constexpr DWORD ioctl_vibe_mat_tap_read = 0x0022600aUL;
@@ -76,12 +85,15 @@ namespace atmos_mat_host {
         return {completed == TRUE, error, bytes};
       }
       bool refresh_session() {
-        tap_status status {};
+        tap_caps caps {};
         const tap_request request {0x3154414dU, 1, 0, sizeof(tap_request), 0, sizeof(tap_request), 0, 0, 0};
-        const auto result = invoke_ioctl(ioctl_vibe_mat_tap_status, request, &status, sizeof(status));
-        if (!result.ok || result.bytes != sizeof(status) || status.magic != 0x3154414dU || status.major != 1 || status.minor > 0 ||
-            status.header_bytes != sizeof(status) || status.reserved0 != 0 || status.total_bytes != sizeof(status) || status.reserved1 != 0) return false;
-        session_ = validate_tap_session(status.driver_generation, status.stream_id);
+        const auto result = invoke_ioctl(ioctl_vibe_mat_tap_query_caps, request, &caps, sizeof(caps));
+        if (!result.ok || result.bytes != sizeof(caps) || caps.magic != 0x3154414dU || caps.major != 1 || caps.minor > 0 ||
+            caps.header_bytes != sizeof(caps) || caps.reserved0 != 0 || caps.total_bytes != sizeof(caps) ||
+            caps.format_bytes != caps.format.size() || caps.reserved1 != 0) return false;
+        if (std::any_of(expected_.bytes.begin(), expected_.bytes.end(), [](const auto byte) { return byte != 0; }) &&
+            caps.format != expected_.bytes) return false;
+        session_ = validate_tap_session(caps.driver_generation, caps.stream_id);
         return session_.has_value();
       }
       descriptor_identity expected_ {};
