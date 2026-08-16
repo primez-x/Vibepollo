@@ -250,6 +250,16 @@ TEST(AtmosCapabilityProbePolicy, RequiresStableBookendedDefaultRouteLink) {
     render_id_a,
     render_id_a));
 
+  const auto selected_endpoint_id = stable.selected_endpoint->id;
+  EXPECT_FALSE(atmos_probe::default_route_link_is_stable(
+    stable.selected_endpoint,
+    initial_defaults,
+    initial_defaults,
+    selected_endpoint_id,
+    selected_endpoint_id,
+    selected_endpoint_id,
+    selected_endpoint_id));
+
   auto switched_core_defaults = initial_defaults;
   switched_core_defaults[2].endpoint->id = "endpoint-b";
   EXPECT_FALSE(atmos_probe::default_route_link_is_stable(
@@ -309,6 +319,44 @@ TEST(AtmosCapabilityProbePolicy, BlocksUnlinkedOrMismatchedSpatialDeviceIds) {
   mismatched.spatial.returned_render_device_id = "different-winrt-id";
   expect_gate_result(
     atmos_probe::evaluate(mismatched),
+    false,
+    mat_profile::mat21,
+    std::vector<mat_profile> {mat_profile::mat21, mat_profile::mat20},
+    std::vector<diagnostic> {diagnostic::spatial_device_id_unlinked}
+  );
+
+  auto collapsed_namespace = ready_observation();
+  collapsed_namespace.spatial.input_render_device_id =
+    collapsed_namespace.selected_endpoint->id;
+  collapsed_namespace.spatial.returned_render_device_id =
+    collapsed_namespace.selected_endpoint->id;
+  expect_gate_result(
+    atmos_probe::evaluate(collapsed_namespace),
+    false,
+    mat_profile::mat21,
+    std::vector<mat_profile> {mat_profile::mat21, mat_profile::mat20},
+    std::vector<diagnostic> {diagnostic::spatial_device_id_unlinked}
+  );
+
+  auto input_namespace_collision = ready_observation();
+  input_namespace_collision.spatial.configuration_available = false;
+  input_namespace_collision.spatial.input_render_device_id =
+    input_namespace_collision.selected_endpoint->id;
+  input_namespace_collision.spatial.returned_render_device_id.clear();
+  expect_gate_result(
+    atmos_probe::evaluate(input_namespace_collision),
+    false,
+    mat_profile::mat21,
+    std::vector<mat_profile> {mat_profile::mat21, mat_profile::mat20},
+    std::vector<diagnostic> {diagnostic::spatial_device_id_unlinked}
+  );
+
+  auto returned_namespace_collision = ready_observation();
+  returned_namespace_collision.spatial.configuration_available = false;
+  returned_namespace_collision.spatial.returned_render_device_id =
+    returned_namespace_collision.selected_endpoint->id;
+  expect_gate_result(
+    atmos_probe::evaluate(returned_namespace_collision),
     false,
     mat_profile::mat21,
     std::vector<mat_profile> {mat_profile::mat21, mat_profile::mat20},

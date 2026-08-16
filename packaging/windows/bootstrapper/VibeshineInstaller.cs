@@ -6,9 +6,11 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
+using Microsoft.Win32.SafeHandles;
 using System.Reflection;
 using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -1224,33 +1226,15 @@ namespace VibepolloInstaller {
     }
 
     private static string NormalizeInstallPath(string installPath) {
-      var trimmedPath = (installPath ?? string.Empty).Trim();
-      if (trimmedPath.Length == 0) {
-        throw new InvalidOperationException("Choose an install folder before clicking Install or Update.");
-      }
-
-      string fullPath;
       try {
-        fullPath = Path.GetFullPath(trimmedPath);
-      } catch (Exception ex) {
-        if (ex is ArgumentException || ex is NotSupportedException || ex is PathTooLongException) {
-          throw new InvalidOperationException("The install folder path is invalid. Choose a different folder and try again.");
-        }
+        return InstallerRunner.NormalizeInstallPath(installPath);
+      } catch (InvalidOperationException) {
         throw;
+      } catch (Exception ex) {
+        throw new InvalidOperationException(
+          "The install folder path is invalid. Choose a subdirectory under 64-bit Program Files.",
+          ex);
       }
-
-      // Block UNC / network paths — Windows services cannot reliably run from network locations
-      if (fullPath.StartsWith(@"\\", StringComparison.Ordinal)) {
-        throw new InvalidOperationException("Network paths (UNC) are not supported. Vibepollo runs as a Windows service and must be installed on a local drive.");
-      }
-
-      // Verify the drive exists
-      var root = Path.GetPathRoot(fullPath);
-      if (!string.IsNullOrEmpty(root) && !Directory.Exists(root)) {
-        throw new InvalidOperationException("The drive " + root.TrimEnd('\\') + " does not exist. Choose an install folder on an available local drive.");
-      }
-
-      return fullPath;
     }
 
     /// <summary>
@@ -2214,7 +2198,6 @@ namespace VibepolloInstaller {
       Console.WriteLine("  VibepolloSetup.exe [MSI options]  Pass options to msiexec");
       Console.WriteLine();
       Console.WriteLine("Wrapper options:");
-      Console.WriteLine("  --msi <path>    Use a specific MSI payload instead of the embedded one");
       Console.WriteLine("  --ui            Force graphical mode (default when no arguments given)");
       Console.WriteLine("  --no-ui         Force command-line passthrough mode");
       Console.WriteLine("  --uninstall-ui  Open graphical UI in uninstall mode");
@@ -2222,17 +2205,16 @@ namespace VibepolloInstaller {
       Console.WriteLine("  /?, /h, --help  Show this help message");
       Console.WriteLine();
       Console.WriteLine("Supported MSI properties:");
-      Console.WriteLine("  INSTALL_ROOT=<path>  Install to a custom directory (default: %ProgramFiles%\\Apollo)");
+      Console.WriteLine("  INSTALL_ROOT=<path>  Install under the native 64-bit %ProgramFiles% subtree (default: %ProgramFiles%\\Apollo)");
       Console.WriteLine("  INSTALL_VIRTUAL_DISPLAY_DRIVER=0  Use SudoVDA instead of the default Vibepollo Display Driver");
       Console.WriteLine();
       Console.WriteLine("Examples:");
       Console.WriteLine("  VibepolloSetup.exe /qn");
-      Console.WriteLine("  VibepolloSetup.exe /qn INSTALL_ROOT=\"D:\\Vibepollo\"");
+      Console.WriteLine("  VibepolloSetup.exe /qn INSTALL_ROOT=\"%ProgramFiles%\\Apollo\"");
       Console.WriteLine("  VibepolloSetup.exe /x {PRODUCT-CODE} /qn");
       Console.WriteLine("  VibepolloSetup.exe /qn INSTALL_VIRTUAL_DISPLAY_DRIVER=0");
       Console.WriteLine("  VibepolloSetup.exe /uninstall");
       Console.WriteLine("  VibepolloSetup.exe /uninstall /quiet");
-      Console.WriteLine("  VibepolloSetup.exe --msi C:\\temp\\Vibepollo.msi /passive");
 #endif
     }
 
@@ -2297,6 +2279,7 @@ namespace VibepolloInstaller {
       "playnite-launcher",
       "playnite_launcher",
       "sunshine_display_helper",
+      "sunshine_audio_policy_helper",
       "apollo",
       "apollosvc",
       "vibepollo"
@@ -2368,9 +2351,175 @@ namespace VibepolloInstaller {
     public static string DefaultInstallDirectory {
       get {
         return Path.Combine(
-          Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+          GetNativeProgramFilesDirectory(),
           "Apollo");
       }
+    }
+
+    private sealed class PinnedMsiPayload : IDisposable {
+      public string Path { get; private set; }
+      public string Sha256 { get; private set; }
+      public string ProductCode { get; private set; }
+      public FileStream Stream { get; private set; }
+      private readonly List<SafeFileHandle> _ancestorPins;
+
+      public PinnedMsiPayload(
+        string path,
+        string sha256,
+        FileStream stream,
+        List<SafeFileHandle> ancestorPins,
+        string productCode = null) {
+        Path = path;
+        Sha256 = sha256;
+        ProductCode = NormalizeProductCode(productCode);
+        Stream = stream;
+        _ancestorPins = ancestorPins ?? new List<SafeFileHandle>();
+      }
+
+      public void Dispose() {
+        if (Stream != null) {
+          Stream.Dispose();
+          Stream = null;
+        }
+        foreach (var pin in _ancestorPins) {
+          if (pin != null) {
+            pin.Dispose();
+          }
+        }
+        _ancestorPins.Clear();
+      }
+    }
+
+    private static readonly object ApprovedPayloadLock = new object();
+    private static readonly Dictionary<string, string> ApprovedPayloadHashes =
+      new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    private static readonly Lazy<string> TrustedInstallerCacheRoot =
+      new Lazy<string>(CreateTrustedInstallerCacheRoot, true);
+
+    private static string GetNativeProgramFilesDirectory() {
+      var view = Environment.Is64BitOperatingSystem
+        ? RegistryView.Registry64
+        : RegistryView.Default;
+      try {
+        using (var machine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, view))
+        using (var currentVersion = machine.OpenSubKey(
+          @"SOFTWARE\Microsoft\Windows\CurrentVersion",
+          false)) {
+          var configured = currentVersion == null
+            ? string.Empty
+            : Convert.ToString(currentVersion.GetValue(
+              "ProgramFilesDir",
+              string.Empty,
+              RegistryValueOptions.DoNotExpandEnvironmentNames));
+          if (!string.IsNullOrWhiteSpace(configured)) {
+            return Path.GetFullPath(configured)
+              .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+          }
+        }
+      } catch (Exception ex) {
+        if (!(ex is IOException) && !(ex is UnauthorizedAccessException) &&
+            !(ex is System.Security.SecurityException)) {
+          throw;
+        }
+      }
+      if (!Environment.Is64BitOperatingSystem || Environment.Is64BitProcess) {
+        var fallback = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        if (!string.IsNullOrWhiteSpace(fallback)) {
+          return Path.GetFullPath(fallback)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+      }
+      throw new InvalidOperationException(
+        "Windows did not provide the native 64-bit Program Files directory.");
+    }
+
+    private static void ValidateInstallPathComponents(string fullPath, string programFiles) {
+      var relative = fullPath.Substring(programFiles.Length)
+        .TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+      var invalid = Path.GetInvalidFileNameChars();
+      foreach (var component in relative.Split(
+        new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+        StringSplitOptions.RemoveEmptyEntries)) {
+        if (component.EndsWith(".", StringComparison.Ordinal) ||
+            component.EndsWith(" ", StringComparison.Ordinal) ||
+            component.IndexOf('%') >= 0 ||
+            component.IndexOfAny(invalid) >= 0 ||
+            component.Any(character => char.IsControl(character))) {
+          throw new InvalidOperationException(
+            "The install folder contains a Windows-reserved path component.");
+        }
+        var deviceName = component.Split('.')[0].ToUpperInvariant();
+        var numberedDevice = deviceName.Length == 4 &&
+          (deviceName.StartsWith("COM", StringComparison.Ordinal) ||
+           deviceName.StartsWith("LPT", StringComparison.Ordinal)) &&
+          deviceName[3] >= '1' && deviceName[3] <= '9';
+        if (deviceName == "CON" || deviceName == "PRN" ||
+            deviceName == "AUX" || deviceName == "NUL" ||
+            deviceName == "CLOCK$" || numberedDevice) {
+          throw new InvalidOperationException(
+            "The install folder contains a Windows-reserved device name.");
+        }
+      }
+    }
+
+    // The LocalSystem service and its audio-policy helper must execute only
+    // from a canonical, non-reparse subtree of the native 64-bit Program Files
+    // directory. This is intentionally shared by UI, elevated, direct MSI,
+    // quiet, and bootstrapper entry paths.
+    internal static string NormalizeInstallPath(string installPath) {
+      var trimmedPath = (installPath ?? string.Empty).Trim().Trim('"');
+      if (trimmedPath.Length == 0) {
+        throw new InvalidOperationException(
+          "Choose an install folder before clicking Install or Update.");
+      }
+
+      string fullPath;
+      try {
+        fullPath = Path.GetFullPath(trimmedPath)
+          .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+      } catch (Exception ex) {
+        if (ex is ArgumentException || ex is NotSupportedException || ex is PathTooLongException) {
+          throw new InvalidOperationException(
+            "The install folder path is invalid. Choose a subdirectory under 64-bit Program Files.",
+            ex);
+        }
+        throw;
+      }
+
+      var programFiles = GetNativeProgramFilesDirectory();
+      var requiredPrefix = programFiles + Path.DirectorySeparatorChar;
+      if (string.Equals(fullPath, programFiles, StringComparison.OrdinalIgnoreCase) ||
+          !fullPath.StartsWith(requiredPrefix, StringComparison.OrdinalIgnoreCase)) {
+        throw new InvalidOperationException(
+          "Vibepollo must be installed in a subdirectory of the native 64-bit Program Files directory.");
+      }
+      ValidateInstallPathComponents(fullPath, programFiles);
+
+      var current = fullPath;
+      for (;;) {
+        if (Directory.Exists(current) || File.Exists(current)) {
+          try {
+            if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) {
+              throw new InvalidOperationException(
+                "The install folder or one of its existing ancestors is a reparse point.");
+            }
+          } catch (FileNotFoundException) {
+          } catch (DirectoryNotFoundException) {
+          }
+        }
+        if (string.Equals(current, programFiles, StringComparison.OrdinalIgnoreCase)) {
+          break;
+        }
+        var parent = Directory.GetParent(current);
+        if (parent == null) {
+          throw new InvalidOperationException(
+            "The install folder is not beneath the native 64-bit Program Files directory.");
+        }
+        current = parent.FullName.TrimEnd(
+          Path.DirectorySeparatorChar,
+          Path.AltDirectorySeparatorChar);
+      }
+      return fullPath;
     }
 
     public static bool IsSunshineVirtualDisplayDriverEnabledInConfiguration(string installDirectory) {
@@ -3201,12 +3350,69 @@ namespace VibepolloInstaller {
     private const uint MsiOpenPackageIgnoreMachineState = 1;
     private const int MsiNullInteger = int.MinValue;
     private const int MsiModifyUpdate = 2;
+    private const uint GenericRead = 0x80000000;
+    private const uint ReadControl = 0x00020000;
+    private const uint FileReadAttributes = 0x00000080;
+    private const uint FileShareRead = 0x00000001;
+    private const uint FileShareWrite = 0x00000002;
+    private const uint OpenExisting = 3;
+    private const uint FileFlagBackupSemantics = 0x02000000;
+    private const uint FileFlagOpenReparsePoint = 0x00200000;
+    private const uint FileAttributeReparsePoint = 0x00000400;
+    private const uint FileNameNormalized = 0x0;
+    private const uint VolumeNameDos = 0x0;
+    private const uint WinTrustDataUiNone = 2;
+    private const uint WinTrustDataRevokeWholeChain = 1;
+    private const uint WinTrustDataChoiceFile = 1;
+    private const uint WinTrustDataStateActionIgnore = 0;
+    private const uint WinTrustDataSaferFlag = 0x00000100;
+    private static readonly Guid WinTrustActionGenericVerifyV2 =
+      new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
     // INSTALLSTATE_DEFAULT: Windows Installer reports the product as installed
     // and usable in the calling context.  Every other INSTALLSTATE value
     // (UNKNOWN, ADVERTISED, ABSENT, INVALIDARG, ...) means the ProductCode is
     // not a live per-machine installation.
     private const int MsiInstallStateDefault = 5;
     private static readonly IntPtr MsiDbOpenTransact = new IntPtr(1);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WinTrustFileInfo {
+      public uint StructSize;
+      public IntPtr FilePath;
+      public IntPtr FileHandle;
+      public IntPtr KnownSubject;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WinTrustData {
+      public uint StructSize;
+      public IntPtr PolicyCallbackData;
+      public IntPtr SipClientData;
+      public uint UiChoice;
+      public uint RevocationChecks;
+      public uint UnionChoice;
+      public IntPtr FileInfo;
+      public uint StateAction;
+      public IntPtr StateData;
+      public IntPtr UrlReference;
+      public uint ProviderFlags;
+      public uint UiContext;
+      public IntPtr SignatureSettings;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation {
+      public uint FileAttributes;
+      public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+      public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+      public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+      public uint VolumeSerialNumber;
+      public uint FileSizeHigh;
+      public uint FileSizeLow;
+      public uint NumberOfLinks;
+      public uint FileIndexHigh;
+      public uint FileIndexLow;
+    }
 
     [DllImport("msi.dll", CharSet = CharSet.Unicode)]
     private static extern uint MsiOpenPackageEx(string szPackagePath, uint dwOptions, out IntPtr hProduct);
@@ -3239,6 +3445,16 @@ namespace VibepolloInstaller {
     private static extern int MsiRecordGetInteger(IntPtr hRecord, uint iField);
 
     [DllImport("msi.dll")]
+    private static extern uint MsiRecordDataSize(IntPtr hRecord, uint iField);
+
+    [DllImport("msi.dll")]
+    private static extern uint MsiRecordReadStream(
+      IntPtr hRecord,
+      uint iField,
+      [Out] byte[] buffer,
+      ref uint bufferSize);
+
+    [DllImport("msi.dll")]
     private static extern uint MsiRecordSetInteger(IntPtr hRecord, uint iField, int iValue);
 
     [DllImport("msi.dll")]
@@ -3249,6 +3465,34 @@ namespace VibepolloInstaller {
 
     [DllImport("msi.dll")]
     private static extern uint MsiDatabaseCommit(IntPtr hDatabase);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+      string fileName,
+      uint desiredAccess,
+      uint shareMode,
+      IntPtr securityAttributes,
+      uint creationDisposition,
+      uint flagsAndAttributes,
+      IntPtr templateFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandle(
+      SafeFileHandle file,
+      StringBuilder filePath,
+      uint filePathSize,
+      uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+      SafeFileHandle file,
+      out ByHandleFileInformation information);
+
+    [DllImport("wintrust.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern int WinVerifyTrust(
+      IntPtr window,
+      [In] ref Guid action,
+      IntPtr trustData);
 
     // Add/Remove Programs keys outlive failed uninstalls, so registry evidence
     // alone cannot say whether a ProductCode is a real installation.  Ask
@@ -3297,6 +3541,26 @@ namespace VibepolloInstaller {
       bool installVirtualDisplayDriver,
       bool saveInstallLogs,
       bool allowSelfElevation = true) {
+      string payloadFailure;
+      if (RejectUntrustedCliPayloadRequest(
+            arguments,
+            IsProcessElevated(),
+            out payloadFailure)) {
+        return new InstallerResult {
+          Operation = InstallerOperation.Install,
+          ExitCode = 1603,
+          Message = payloadFailure
+        };
+      }
+      try {
+        installDirectory = NormalizeInstallPath(installDirectory);
+      } catch (Exception ex) {
+        return new InstallerResult {
+          Operation = InstallerOperation.Install,
+          ExitCode = 1603,
+          Message = "The install location is not trusted: " + ex.Message
+        };
+      }
       if (allowSelfElevation && !IsProcessElevated()) {
         return RunElevatedBootstrapperInstall(arguments, installDirectory, installVirtualDisplayDriver, saveInstallLogs);
       }
@@ -3614,233 +3878,23 @@ namespace VibepolloInstaller {
       return result;
     }
 
-    private static InstallerResult UninstallLegacySunshineRegistration() {
-      var legacyRegistration = GetLegacySunshineRegistration();
-      if (legacyRegistration == null) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 0,
-          Message = "No legacy Sunshine installation was found."
-        };
-      }
-
-      var uninstallCommand = string.IsNullOrWhiteSpace(legacyRegistration.QuietUninstallString)
-        ? legacyRegistration.UninstallString
-        : legacyRegistration.QuietUninstallString;
-      if (string.IsNullOrWhiteSpace(uninstallCommand)) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 1603,
-          Message = "Legacy Sunshine was detected, but no uninstall command was found."
-        };
-      }
-
-      string executablePath;
-      string uninstallArguments;
-      if (!TrySplitExecutableAndArguments(uninstallCommand, out executablePath, out uninstallArguments)) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 1603,
-          Message = "Legacy Sunshine was detected, but the uninstall command could not be parsed."
-        };
-      }
-
-      var looksLikePath = executablePath.IndexOf('\\') >= 0 || executablePath.IndexOf('/') >= 0;
-      if (looksLikePath && !File.Exists(executablePath)) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 0,
-          Message = "Legacy Sunshine uninstall entry is stale; continuing with Vibepollo installation."
-        };
-      }
-
-      if (string.IsNullOrWhiteSpace(legacyRegistration.QuietUninstallString) &&
-          !IsMsiexecExecutable(executablePath) &&
-          !HasQuietUninstallSwitch(uninstallArguments)) {
-        uninstallArguments = string.IsNullOrWhiteSpace(uninstallArguments)
-          ? "/S"
-          : uninstallArguments + " /S";
-      }
-
-      int exitCode;
-      try {
-        var startInfo = new ProcessStartInfo {
-          FileName = executablePath,
-          Arguments = uninstallArguments ?? string.Empty,
-          UseShellExecute = false,
-          CreateNoWindow = true,
-          WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory
-        };
-
-        using (var process = Process.Start(startInfo)) {
-          if (process == null) {
-            return new InstallerResult {
-              Operation = InstallerOperation.Uninstall,
-              ExitCode = 1603,
-              Message = "Legacy Sunshine uninstall could not be started."
-            };
-          }
-
-          process.WaitForExit();
-          exitCode = process.ExitCode;
-        }
-      } catch (Exception ex) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 1603,
-          Message = "Legacy Sunshine uninstall failed to launch: " + ex.Message
-        };
-      }
-
-      if (exitCode != 0 && exitCode != 3010) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = exitCode,
-          Message = BuildResultMessage("Uninstall", exitCode, string.Empty)
-        };
-      }
-
-      if (!WaitForLegacySunshineRemoval(120)) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 1603,
-          Message = "Legacy Sunshine is still installed. Please uninstall Sunshine completely, then run the installer again."
-        };
-      }
-
+    private static InstallerResult ManualLegacyRemovalRequired(string product) {
       return new InstallerResult {
         Operation = InstallerOperation.Uninstall,
-        ExitCode = exitCode,
-        Message = BuildResultMessage("Uninstall", exitCode, string.Empty)
+        ExitCode = 1603,
+        Message = (product ?? "A legacy product")
+          + " must be removed manually before continuing. Vibepollo will not execute an older or registry-sourced uninstaller with elevated privileges before its native MSI trust gate."
       };
     }
 
-    private static bool WaitForLegacySunshineRemoval(int timeoutSeconds) {
-      var timeout = timeoutSeconds <= 0 ? 1 : timeoutSeconds;
-      var deadline = DateTime.UtcNow.AddSeconds(timeout);
-      while (DateTime.UtcNow < deadline) {
-        if (GetLegacySunshineRegistration() == null) {
-          return true;
-        }
-        System.Threading.Thread.Sleep(1000);
-      }
-
-      return GetLegacySunshineRegistration() == null;
+    private static InstallerResult UninstallLegacySunshineRegistration() {
+      return ManualLegacyRemovalRequired("legacy Sunshine");
     }
 
     private static InstallerResult UninstallLegacyApolloRegistration() {
-      var legacyRegistration = GetLegacyApolloRegistration();
-      if (legacyRegistration == null) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 0,
-          Message = "No legacy Apollo installation was found."
-        };
-      }
-
-      var uninstallCommand = string.IsNullOrWhiteSpace(legacyRegistration.QuietUninstallString)
-        ? legacyRegistration.UninstallString
-        : legacyRegistration.QuietUninstallString;
-      if (string.IsNullOrWhiteSpace(uninstallCommand)) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 1603,
-          Message = "Legacy Apollo was detected, but no uninstall command was found."
-        };
-      }
-
-      string executablePath;
-      string uninstallArguments;
-      if (!TrySplitExecutableAndArguments(uninstallCommand, out executablePath, out uninstallArguments)) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 1603,
-          Message = "Legacy Apollo was detected, but the uninstall command could not be parsed."
-        };
-      }
-
-      var looksLikePath = executablePath.IndexOf('\\') >= 0 || executablePath.IndexOf('/') >= 0;
-      if (looksLikePath && !File.Exists(executablePath)) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 0,
-          Message = "Legacy Apollo uninstall entry is stale; continuing with Vibepollo installation."
-        };
-      }
-
-      if (string.IsNullOrWhiteSpace(legacyRegistration.QuietUninstallString) &&
-          !IsMsiexecExecutable(executablePath) &&
-          !HasQuietUninstallSwitch(uninstallArguments)) {
-        uninstallArguments = string.IsNullOrWhiteSpace(uninstallArguments)
-          ? "/S"
-          : uninstallArguments + " /S";
-      }
-
-      int exitCode;
-      try {
-        var startInfo = new ProcessStartInfo {
-          FileName = executablePath,
-          Arguments = uninstallArguments ?? string.Empty,
-          UseShellExecute = false,
-          CreateNoWindow = true,
-          WorkingDirectory = AppDomain.CurrentDomain.BaseDirectory
-        };
-
-        using (var process = Process.Start(startInfo)) {
-          if (process == null) {
-            return new InstallerResult {
-              Operation = InstallerOperation.Uninstall,
-              ExitCode = 1603,
-              Message = "Legacy Apollo uninstall could not be started."
-            };
-          }
-
-          process.WaitForExit();
-          exitCode = process.ExitCode;
-        }
-      } catch (Exception ex) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 1603,
-          Message = "Legacy Apollo uninstall failed to launch: " + ex.Message
-        };
-      }
-
-      if (exitCode != 0 && exitCode != 3010) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = exitCode,
-          Message = BuildResultMessage("Uninstall", exitCode, string.Empty)
-        };
-      }
-
-      if (!WaitForLegacyApolloRemoval(120)) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 1603,
-          Message = "Legacy Apollo is still installed. Please uninstall Apollo completely, then run the installer again."
-        };
-      }
-
-      return new InstallerResult {
-        Operation = InstallerOperation.Uninstall,
-        ExitCode = exitCode,
-        Message = BuildResultMessage("Uninstall", exitCode, string.Empty)
-      };
+      return ManualLegacyRemovalRequired("legacy Apollo");
     }
 
-    private static bool WaitForLegacyApolloRemoval(int timeoutSeconds) {
-      var timeout = timeoutSeconds <= 0 ? 1 : timeoutSeconds;
-      var deadline = DateTime.UtcNow.AddSeconds(timeout);
-      while (DateTime.UtcNow < deadline) {
-        if (GetLegacyApolloRegistration() == null) {
-          return true;
-        }
-        System.Threading.Thread.Sleep(1000);
-      }
-
-      return GetLegacyApolloRegistration() == null;
-    }
 
     private static bool ValidatePayloadRegisteredAfterInstall(string msiPath, string logPath, out string failureMessage) {
       failureMessage = string.Empty;
@@ -5240,21 +5294,6 @@ namespace VibepolloInstaller {
       return executablePath.Length > 0;
     }
 
-    private static int RunUninstallCommand(InstalledProductInfo product, bool hiddenWindow, bool requestElevationIfNeeded) {
-      var commandLine = BuildSilentUninstallCommand(product);
-      if (string.IsNullOrWhiteSpace(commandLine)) {
-        return 1;
-      }
-
-      string executablePath;
-      string arguments;
-      if (!TrySplitExecutableAndArguments(commandLine, out executablePath, out arguments)) {
-        return 1;
-      }
-
-      return RunProcess(executablePath, arguments, hiddenWindow, requestElevationIfNeeded);
-    }
-
     private static string BuildSilentUninstallCommand(InstalledProductInfo product) {
       var commandLine = string.IsNullOrWhiteSpace(product == null ? null : product.QuietUninstallString)
         ? (product == null ? string.Empty : product.UninstallString)
@@ -5347,6 +5386,13 @@ namespace VibepolloInstaller {
       bool factoryResetAppData = false,
       bool removeVirtualDisplayDriver = false,
       bool allowSelfElevation = true) {
+      if (arguments != null && !string.IsNullOrWhiteSpace(arguments.MsiPathOverride)) {
+        return new InstallerResult {
+          Operation = InstallerOperation.Uninstall,
+          ExitCode = 1603,
+          Message = "MSI overrides are not accepted for uninstall. Use the registered ProductCode."
+        };
+      }
       if (allowSelfElevation && !IsProcessElevated()) {
         return RunElevatedBootstrapperUninstall(arguments, factoryResetAppData, removeVirtualDisplayDriver);
       }
@@ -5366,6 +5412,45 @@ namespace VibepolloInstaller {
     }
 
     public static InstallerResult RunCli(InstallerArguments arguments) {
+      string payloadFailure;
+      if (RejectUntrustedCliPayloadRequest(
+            arguments,
+            IsProcessElevated(),
+            out payloadFailure)) {
+        return new InstallerResult {
+          Operation = InstallerOperation.Install,
+          ExitCode = 1603,
+          Message = payloadFailure
+        };
+      }
+
+      if (!IsRegisteredMaintenanceOperation(arguments.ForwardedArguments)) {
+        return RunCliWithPinnedMaintenancePayload(arguments, null);
+      }
+
+      try {
+        using (var pinnedMaintenancePayload =
+          OpenPinnedRegisteredMaintenancePayload(arguments.ForwardedArguments)) {
+          if (pinnedMaintenancePayload == null) {
+            throw new InvalidDataException(
+              "The registered MSI cache could not be authenticated and pinned.");
+          }
+          return RunCliWithPinnedMaintenancePayload(arguments, pinnedMaintenancePayload);
+        }
+      } catch (Exception ex) {
+        return new InstallerResult {
+          Operation = IsMsiUninstallOperation(arguments.ForwardedArguments)
+            ? InstallerOperation.Uninstall
+            : InstallerOperation.Install,
+          ExitCode = 1603,
+          Message = "The registered MSI cache is not trusted: " + ex.Message
+        };
+      }
+    }
+
+    private static InstallerResult RunCliWithPinnedMaintenancePayload(
+      InstallerArguments arguments,
+      PinnedMsiPayload pinnedMaintenancePayload) {
       var cliArgs = new List<string>(arguments.ForwardedArguments);
       var hasOperation = cliArgs.Any(IsOperationSwitch);
       var installMsiPath = string.Empty;
@@ -5377,6 +5462,18 @@ namespace VibepolloInstaller {
       if (!IsProcessElevated()
           && string.IsNullOrWhiteSpace(arguments.MsiPathOverride)
           && ShouldElevateCliForEmbeddedPayload(cliArgs, hasOperation)) {
+        var requestedInstallRoot = GetPropertyValue(cliArgs, "INSTALL_ROOT");
+        if (!string.IsNullOrWhiteSpace(requestedInstallRoot)) {
+          try {
+            NormalizeInstallPath(requestedInstallRoot);
+          } catch (Exception ex) {
+            return new InstallerResult {
+              Operation = InstallerOperation.Install,
+              ExitCode = 1603,
+              Message = "The install location is not trusted: " + ex.Message
+            };
+          }
+        }
         return RunElevatedBootstrapperCli(arguments);
       }
 
@@ -5413,6 +5510,53 @@ namespace VibepolloInstaller {
       }
       var isInstallOperation = IsMsiInstallOperation(cliArgs);
       var isUninstallOperation = IsMsiUninstallOperation(cliArgs);
+      if (isInstallOperation) {
+        var operationIndex = cliArgs.FindIndex(IsOperationSwitch);
+        var explicitPath = operationIndex >= 0 && operationIndex + 1 < cliArgs.Count
+          ? cliArgs[operationIndex + 1]
+          : null;
+        if (!string.IsNullOrWhiteSpace(explicitPath)) {
+          var fullExplicitPath = Path.GetFullPath(explicitPath);
+          string approvedHash;
+          lock (ApprovedPayloadLock) {
+            ApprovedPayloadHashes.TryGetValue(fullExplicitPath, out approvedHash);
+          }
+          if (string.IsNullOrWhiteSpace(approvedHash)) {
+            try {
+              var stagedPath = StageDeveloperMsiOverride(fullExplicitPath);
+              cliArgs[operationIndex + 1] = stagedPath;
+              injectedMsiPath = stagedPath;
+            } catch (Exception ex) {
+              return new InstallerResult {
+                Operation = InstallerOperation.Install,
+                ExitCode = 1603,
+                Message = "The developer MSI did not match the embedded trust boundary: " + ex.Message
+              };
+            }
+          }
+        }
+      }
+      if (isInstallOperation) {
+        var requestedInstallRoot = GetPropertyValue(cliArgs, "INSTALL_ROOT");
+        if (!string.IsNullOrWhiteSpace(requestedInstallRoot)) {
+          try {
+            var normalizedInstallRoot = NormalizeInstallPath(requestedInstallRoot);
+            var propertyIndex = cliArgs.FindIndex(
+              arg => arg.StartsWith("INSTALL_ROOT=", StringComparison.OrdinalIgnoreCase));
+            if (propertyIndex >= 0) {
+              cliArgs[propertyIndex] = CreatePropertyArgument(
+                "INSTALL_ROOT",
+                normalizedInstallRoot);
+            }
+          } catch (Exception ex) {
+            return new InstallerResult {
+              Operation = InstallerOperation.Install,
+              ExitCode = 1603,
+              Message = "The install location is not trusted: " + ex.Message
+            };
+          }
+        }
+      }
       if (isInstallOperation) {
         installMsiPath = GetMsiPathArgument(cliArgs) ?? string.Empty;
       }
@@ -5595,7 +5739,9 @@ namespace VibepolloInstaller {
       var registrationRecoveryProduct = isInstallOperation
         ? TryGetUnambiguousMsiRegistrationRecoveryProduct(InstalledProductKind.Vibepollo)
         : null;
-      var exitCode = RunMsiexec(cliArgs, arguments.IsCliQuietMode(), true);
+      var exitCode = pinnedMaintenancePayload == null
+        ? RunMsiexec(cliArgs, arguments.IsCliQuietMode(), true)
+        : RunMsiexec(cliArgs, arguments.IsCliQuietMode(), true, pinnedMaintenancePayload);
       if (isInstallOperation) {
         exitCode = RetryInstallWithSameProductReinstallIfNeeded(
           exitCode,
@@ -5792,88 +5938,19 @@ namespace VibepolloInstaller {
         InstalledProductKind.Vibeshine,
         InstalledProductKind.Apollo
       };
-      var hasMsiMigrationTarget = GetInstalledProducts(true)
-        .Any(product => migrationKinds.Contains(product.Kind));
-      var hasLegacySunshineRegistration = GetLegacySunshineRegistration() != null;
-      var hasLegacyApolloRegistration = GetLegacyApolloRegistration() != null;
-      if (!hasMsiMigrationTarget && !hasLegacySunshineRegistration && !hasLegacyApolloRegistration) {
-        return new InstallerResult {
+      var migrationRequired = GetInstalledProducts(true)
+        .Any(product => migrationKinds.Contains(product.Kind))
+        || GetLegacySunshineRegistration() != null
+        || GetLegacyApolloRegistration() != null;
+      return migrationRequired
+        ? ManualLegacyRemovalRequired("Sunshine, Vibeshine, or Apollo detected during migration")
+        : new InstallerResult {
           Operation = InstallerOperation.Uninstall,
           ExitCode = 0,
           Message = "No preinstall migration cleanup is required."
         };
-      }
-
-      TryDrainPreinstallLocks();
-
-      var restartRequired = false;
-      var cleanupLogPath = string.Empty;
-      if (hasMsiMigrationTarget) {
-        var migrationUninstallResult = UninstallInstalledProducts(
-          logPhase,
-          hiddenWindow,
-          requestElevationIfNeeded,
-          false,
-          false,
-          false,
-          new[] {
-            InstalledProductKind.Sunshine,
-            InstalledProductKind.Vibeshine,
-            InstalledProductKind.Apollo
-          });
-        if (migrationUninstallResult.ExitCode != 0 && migrationUninstallResult.ExitCode != 3010) {
-          return migrationUninstallResult;
-        }
-        if (!string.IsNullOrWhiteSpace(migrationUninstallResult.LogPath)) {
-          cleanupLogPath = migrationUninstallResult.LogPath;
-        }
-        if (migrationUninstallResult.ExitCode == 3010) {
-          restartRequired = true;
-        }
-      }
-
-      if (hasLegacySunshineRegistration) {
-        var legacySunshineRegistrationResult = UninstallLegacySunshineRegistration();
-        if (legacySunshineRegistrationResult.ExitCode != 0 && legacySunshineRegistrationResult.ExitCode != 3010) {
-          return legacySunshineRegistrationResult;
-        }
-        if (!string.IsNullOrWhiteSpace(legacySunshineRegistrationResult.LogPath)) {
-          cleanupLogPath = legacySunshineRegistrationResult.LogPath;
-        }
-        if (legacySunshineRegistrationResult.ExitCode == 3010) {
-          restartRequired = true;
-        }
-      }
-
-      if (hasLegacyApolloRegistration) {
-        var legacyApolloRegistrationResult = UninstallLegacyApolloRegistration();
-        if (legacyApolloRegistrationResult.ExitCode != 0 && legacyApolloRegistrationResult.ExitCode != 3010) {
-          return legacyApolloRegistrationResult;
-        }
-        if (!string.IsNullOrWhiteSpace(legacyApolloRegistrationResult.LogPath)) {
-          cleanupLogPath = legacyApolloRegistrationResult.LogPath;
-        }
-        if (legacyApolloRegistrationResult.ExitCode == 3010) {
-          restartRequired = true;
-        }
-      }
-
-      if (restartRequired) {
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = 3010,
-          Message = "Migration cleanup completed and requires a reboot before installation can continue.",
-          LogPath = cleanupLogPath
-        };
-      }
-
-      return new InstallerResult {
-        Operation = InstallerOperation.Uninstall,
-        ExitCode = 0,
-        Message = "Preinstall migration cleanup succeeded.",
-        LogPath = cleanupLogPath
-      };
     }
+
 
     private static readonly string[] PreinstallServiceNames = {
       "SunshineService",
@@ -5890,6 +5967,7 @@ namespace VibepolloInstaller {
       "vibeshine",
       "sunshine",
       "sunshinesvc",
+      "sunshine_audio_policy_helper",
       "apollo",
       "vibepollo"
     };
@@ -6086,6 +6164,179 @@ namespace VibepolloInstaller {
     private static bool IsMsiUninstallOperation(List<string> cliArgs) {
       var operation = cliArgs == null ? null : cliArgs.FirstOrDefault(IsOperationSwitch);
       return string.Equals(operation, "/x", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsMsiUninstallOperation(IReadOnlyList<string> cliArgs) {
+      var operation = cliArgs == null ? null : cliArgs.FirstOrDefault(IsOperationSwitch);
+      return string.Equals(operation, "/x", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsRegisteredMaintenanceOperation(IReadOnlyList<string> cliArgs) {
+      var operation = cliArgs == null ? null : cliArgs.FirstOrDefault(IsOperationSwitch);
+      return string.Equals(operation, "/x", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(operation, "/f", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryGetSoleMsiOperationTarget(
+      IReadOnlyList<string> arguments,
+      out int operationIndex,
+      out string operation,
+      out int targetIndex,
+      out string target) {
+      operationIndex = -1;
+      operation = string.Empty;
+      targetIndex = -1;
+      target = string.Empty;
+      if (arguments == null) {
+        return false;
+      }
+
+      for (var index = 0; index < arguments.Count; index++) {
+        var token = (arguments[index] ?? string.Empty).Trim().Trim('"');
+        if (!IsOperationSwitch(token)) {
+          continue;
+        }
+        if (operationIndex >= 0) {
+          return false;
+        }
+        operationIndex = index;
+        operation = token;
+      }
+      if (operationIndex < 0 || operationIndex + 1 >= arguments.Count) {
+        return false;
+      }
+
+      targetIndex = operationIndex + 1;
+      target = (arguments[targetIndex] ?? string.Empty).Trim().Trim('"');
+      return target.Length != 0 &&
+        !LooksLikeSwitch(target) &&
+        !IsOperationSwitch(target);
+    }
+
+    private static bool LooksLikeAdditionalMsiTarget(string value) {
+      var token = (value ?? string.Empty).Trim().Trim('"');
+      return token.EndsWith(".msi", StringComparison.OrdinalIgnoreCase)
+        || token.EndsWith(".msp", StringComparison.OrdinalIgnoreCase)
+        || token.EndsWith(".mst", StringComparison.OrdinalIgnoreCase)
+        || LooksLikeProductCode(NormalizeProductCode(token));
+    }
+
+    // This policy runs before cache cleanup, registry repair, service/process
+    // changes, or self-elevation. The wrapper never elevates a caller-selected
+    // package, patch, or transform. An already elevated developer may supply a
+    // replacement MSI, but it is copied from a pinned handle and must match the
+    // embedded native trust-boundary Binary and exact MSI table contract.
+    private static bool RejectUntrustedCliPayloadRequest(
+      InstallerArguments arguments,
+      bool processElevated,
+      out string failureMessage) {
+      failureMessage = string.Empty;
+      if (arguments == null) {
+        failureMessage = "Installer arguments were not available.";
+        return true;
+      }
+      var forwarded = arguments.ForwardedArguments ?? new List<string>();
+      var hasOverride = !string.IsNullOrWhiteSpace(arguments.MsiPathOverride);
+      if (hasOverride && !processElevated) {
+        failureMessage =
+          "A developer MSI may be supplied only to an already elevated installer process.";
+        return true;
+      }
+
+      for (var index = 0; index < forwarded.Count; index++) {
+        var raw = (forwarded[index] ?? string.Empty).Trim();
+        var token = raw.Trim('"');
+        var equalsIndex = token.IndexOf('=');
+        var propertyName = equalsIndex > 0 ? token.Substring(0, equalsIndex) : token;
+        if (string.Equals(token, "/p", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "/update", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "/t", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "/transform", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(propertyName, "PATCH", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(propertyName, "TRANSFORMS", StringComparison.OrdinalIgnoreCase) ||
+            token.EndsWith(".msp", StringComparison.OrdinalIgnoreCase) ||
+            token.EndsWith(".mst", StringComparison.OrdinalIgnoreCase)) {
+          failureMessage =
+            "MSI patches and transforms are not accepted by the privileged bootstrapper.";
+          return true;
+        }
+      }
+
+      var operationCount = forwarded.Count(item =>
+        IsOperationSwitch((item ?? string.Empty).Trim().Trim('"')));
+      if (operationCount == 0) {
+        if (forwarded.Any(item => {
+              var token = (item ?? string.Empty).Trim().Trim('"');
+              return token.EndsWith(".msi", StringComparison.OrdinalIgnoreCase);
+            })) {
+          failureMessage = "An explicit MSI requires /i or /package developer mode.";
+          return true;
+        }
+        return false;
+      }
+
+      int operationIndex;
+      int targetIndex;
+      string operation;
+      string target;
+      if (operationCount != 1 || !TryGetSoleMsiOperationTarget(
+            forwarded,
+            out operationIndex,
+            out operation,
+            out targetIndex,
+            out target)) {
+        failureMessage =
+          "Exactly one MSI operation and one corresponding target are required.";
+        return true;
+      }
+
+      for (var index = 0; index < forwarded.Count; index++) {
+        if (index == operationIndex || index == targetIndex) {
+          continue;
+        }
+        var token = (forwarded[index] ?? string.Empty).Trim().Trim('"');
+        if (IsOperationSwitch(token) || LooksLikeAdditionalMsiTarget(token)) {
+          failureMessage =
+            "A second MSI operation, ProductCode, or package target is not accepted.";
+          return true;
+        }
+      }
+
+      if (string.Equals(operation, "/uninstall", StringComparison.OrdinalIgnoreCase)) {
+        failureMessage = "Use /x with a registered ProductCode for uninstall.";
+        return true;
+      }
+      if (string.Equals(operation, "/a", StringComparison.OrdinalIgnoreCase)) {
+        failureMessage = "Administrative-image MSI operations are not supported.";
+        return true;
+      }
+      if (hasOverride) {
+        failureMessage = "Do not combine --msi with a second MSI operation target.";
+        return true;
+      }
+      if (string.Equals(operation, "/x", StringComparison.OrdinalIgnoreCase)) {
+        if (hasOverride || !LooksLikeProductCode(NormalizeProductCode(target))) {
+          failureMessage =
+            "Uninstall accepts only a registered ProductCode; package paths are not elevated.";
+          return true;
+        }
+        return false;
+      }
+      if (string.Equals(operation, "/f", StringComparison.OrdinalIgnoreCase)) {
+        if (!LooksLikeProductCode(NormalizeProductCode(target))) {
+          failureMessage = "Repair accepts only a registered ProductCode.";
+          return true;
+        }
+        return false;
+      }
+      if ((string.Equals(operation, "/i", StringComparison.OrdinalIgnoreCase) ||
+           string.Equals(operation, "/package", StringComparison.OrdinalIgnoreCase)) &&
+          !processElevated) {
+        failureMessage =
+          "An explicit MSI may be used only by an already elevated developer process.";
+        return true;
+      }
+      return false;
     }
 
     private static bool TryNormalizeAndValidateMsiOperationTarget(
@@ -6299,6 +6550,273 @@ namespace VibepolloInstaller {
       return string.IsNullOrWhiteSpace(localPackage) ? null : localPackage;
     }
 
+    private static bool MsiQueryHasRow(IntPtr database, string query) {
+      IntPtr view = IntPtr.Zero;
+      IntPtr record = IntPtr.Zero;
+      try {
+        return MsiDatabaseOpenView(database, query, out view) == MsiErrorSuccess
+          && MsiViewExecute(view, IntPtr.Zero) == MsiErrorSuccess
+          && MsiViewFetch(view, out record) == MsiErrorSuccess;
+      } finally {
+        if (record != IntPtr.Zero) {
+          MsiCloseHandle(record);
+        }
+        if (view != IntPtr.Zero) {
+          MsiViewClose(view);
+          MsiCloseHandle(view);
+        }
+      }
+    }
+
+    private static int? TryReadMsiSequence(IntPtr database, string action) {
+      IntPtr view = IntPtr.Zero;
+      IntPtr record = IntPtr.Zero;
+      try {
+        var query = "SELECT `Sequence` FROM `InstallExecuteSequence` WHERE `Action` = '"
+          + action + "'";
+        if (MsiDatabaseOpenView(database, query, out view) != MsiErrorSuccess
+            || MsiViewExecute(view, IntPtr.Zero) != MsiErrorSuccess
+            || MsiViewFetch(view, out record) != MsiErrorSuccess) {
+          return null;
+        }
+        var value = MsiRecordGetInteger(record, 1);
+        return value == MsiNullInteger ? (int?)null : value;
+      } finally {
+        if (record != IntPtr.Zero) {
+          MsiCloseHandle(record);
+        }
+        if (view != IntPtr.Zero) {
+          MsiViewClose(view);
+          MsiCloseHandle(view);
+        }
+      }
+    }
+
+    private static string ComputeMsiBinaryStreamSha256Hex(string msiPath) {
+      IntPtr database = IntPtr.Zero;
+      IntPtr view = IntPtr.Zero;
+      IntPtr record = IntPtr.Zero;
+      try {
+        if (MsiOpenDatabase(msiPath, IntPtr.Zero, out database) != MsiErrorSuccess ||
+            database == IntPtr.Zero ||
+            MsiDatabaseOpenView(
+              database,
+              "SELECT `Data` FROM `Binary` WHERE `Name`='AudioPolicyInstallTreeSecurityCA'",
+              out view) != MsiErrorSuccess ||
+            MsiViewExecute(view, IntPtr.Zero) != MsiErrorSuccess ||
+            MsiViewFetch(view, out record) != MsiErrorSuccess) {
+          return null;
+        }
+        var size = MsiRecordDataSize(record, 1);
+        if (size == 0 || size > 64u * 1024u * 1024u) {
+          return null;
+        }
+        var bytes = new byte[(int)size];
+        uint offset = 0;
+        while (offset < size) {
+          var requested = Math.Min(64u * 1024u, size - offset);
+          var buffer = new byte[(int)requested];
+          var returned = requested;
+          if (MsiRecordReadStream(record, 1, buffer, ref returned) != MsiErrorSuccess ||
+              returned == 0 || returned > requested) {
+            return null;
+          }
+          Buffer.BlockCopy(buffer, 0, bytes, (int)offset, (int)returned);
+          offset += returned;
+        }
+        using (var hasher = SHA256.Create()) {
+          return string.Concat(hasher.ComputeHash(bytes).Select(value => value.ToString("x2")));
+        }
+      } catch {
+        return null;
+      } finally {
+        if (record != IntPtr.Zero) {
+          MsiCloseHandle(record);
+        }
+        if (view != IntPtr.Zero) {
+          MsiViewClose(view);
+          MsiCloseHandle(view);
+        }
+        if (database != IntPtr.Zero) {
+          MsiCloseHandle(database);
+        }
+      }
+    }
+
+    private static bool IsAuthenticodeTrustValid(string path) {
+      IntPtr filePath = IntPtr.Zero;
+      IntPtr fileInfoPointer = IntPtr.Zero;
+      IntPtr trustDataPointer = IntPtr.Zero;
+      try {
+        filePath = Marshal.StringToCoTaskMemUni(path);
+        var fileInfo = new WinTrustFileInfo {
+          StructSize = (uint)Marshal.SizeOf(typeof(WinTrustFileInfo)),
+          FilePath = filePath,
+          FileHandle = IntPtr.Zero,
+          KnownSubject = IntPtr.Zero
+        };
+        fileInfoPointer = Marshal.AllocCoTaskMem(Marshal.SizeOf(typeof(WinTrustFileInfo)));
+        Marshal.StructureToPtr(fileInfo, fileInfoPointer, false);
+        var trustData = new WinTrustData {
+          StructSize = (uint)Marshal.SizeOf(typeof(WinTrustData)),
+          UiChoice = WinTrustDataUiNone,
+          RevocationChecks = WinTrustDataRevokeWholeChain,
+          UnionChoice = WinTrustDataChoiceFile,
+          FileInfo = fileInfoPointer,
+          StateAction = WinTrustDataStateActionIgnore,
+          ProviderFlags = WinTrustDataSaferFlag
+        };
+        trustDataPointer = Marshal.AllocCoTaskMem(Marshal.SizeOf(typeof(WinTrustData)));
+        Marshal.StructureToPtr(trustData, trustDataPointer, false);
+        var action = WinTrustActionGenericVerifyV2;
+        return WinVerifyTrust(IntPtr.Zero, ref action, trustDataPointer) == 0;
+      } catch {
+        return false;
+      } finally {
+        if (trustDataPointer != IntPtr.Zero) {
+          Marshal.FreeCoTaskMem(trustDataPointer);
+        }
+        if (fileInfoPointer != IntPtr.Zero) {
+          Marshal.FreeCoTaskMem(fileInfoPointer);
+        }
+        if (filePath != IntPtr.Zero) {
+          Marshal.FreeCoTaskMem(filePath);
+        }
+      }
+    }
+
+    private static string TryGetAuthenticodeSignerThumbprint(string path) {
+      try {
+        if (!IsAuthenticodeTrustValid(path)) {
+          return null;
+        }
+        using (var certificate = new X509Certificate2(
+          X509Certificate.CreateFromSignedFile(path))) {
+          return certificate.Thumbprint;
+        }
+      } catch {
+        return null;
+      }
+    }
+
+    private static bool HasMatchingReleasedSigner(string msiPath) {
+      var executableSigner = TryGetAuthenticodeSignerThumbprint(
+        Assembly.GetExecutingAssembly().Location);
+      var msiSigner = TryGetAuthenticodeSignerThumbprint(msiPath);
+      return !string.IsNullOrWhiteSpace(executableSigner) &&
+        string.Equals(executableSigner, msiSigner, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool MsiPackageContainsNativeTrustBoundary(string msiPath) {
+      return MsiPackageContainsNativeTrustBoundary(msiPath, null, true);
+    }
+
+    private static bool MsiPackageContainsNativeTrustBoundary(
+      string msiPath,
+      string expectedBinarySha256,
+      bool requireReleasedSigner) {
+      if (string.IsNullOrWhiteSpace(msiPath) || !File.Exists(msiPath)) {
+        return false;
+      }
+      IntPtr database = IntPtr.Zero;
+      try {
+        var binarySha256 = ComputeMsiBinaryStreamSha256Hex(msiPath);
+        if (string.IsNullOrWhiteSpace(binarySha256) ||
+            (!string.IsNullOrWhiteSpace(expectedBinarySha256) &&
+             !string.Equals(binarySha256, expectedBinarySha256, StringComparison.OrdinalIgnoreCase)) ||
+            (requireReleasedSigner && !HasMatchingReleasedSigner(msiPath)) ||
+            MsiOpenDatabase(msiPath, IntPtr.Zero, out database) != MsiErrorSuccess
+            || database == IntPtr.Zero) {
+          return false;
+        }
+        var exactActions = new[] {
+          "`Action`='PrepareAudioPolicyInstallTreeSecurity' AND `Type`=1 AND `Source`='AudioPolicyInstallTreeSecurityCA' AND `Target`='PrepareAudioPolicyInstallTreeSecurity'",
+          "`Action`='PrepareAudioPolicyUpgradeSecurity' AND `Type`=1 AND `Source`='AudioPolicyInstallTreeSecurityCA' AND `Target`='PrepareAudioPolicyUpgradeSecurity'",
+          "`Action`='RollbackAudioPolicyInstallTreeSecurity' AND `Type`=11585 AND `Source`='AudioPolicyInstallTreeSecurityCA' AND `Target`='RollbackAudioPolicyInstallTreeSecurity'",
+          "`Action`='ProtectAudioPolicyInstallTreeSecurity' AND `Type`=11265 AND `Source`='AudioPolicyInstallTreeSecurityCA' AND `Target`='ProtectAudioPolicyInstallTreeSecurity'",
+          "`Action`='CommitAudioPolicyInstallTreeSecurity' AND `Type`=11841 AND `Source`='AudioPolicyInstallTreeSecurityCA' AND `Target`='CommitAudioPolicyInstallTreeSecurity'",
+          "`Action`='VerifyAudioPolicyUninstallTreeSecurity' AND `Type`=11265 AND `Source`='AudioPolicyInstallTreeSecurityCA' AND `Target`='VerifyAudioPolicyUninstallTreeSecurity'"
+        };
+        if (!MsiQueryHasRow(
+              database,
+              "SELECT `Name` FROM `Binary` WHERE `Name`='AudioPolicyInstallTreeSecurityCA'")
+            || !MsiQueryHasRow(
+              database,
+              "SELECT `Property` FROM `Property` WHERE `Property`='AudioPolicyTrustedInstallRoot' AND `Value`='0'")
+            || !MsiQueryHasRow(
+              database,
+              "SELECT `Property` FROM `Property` WHERE `Property`='AudioPolicyProtectRequired' AND `Value`='0'")
+            || !MsiQueryHasRow(
+              database,
+              "SELECT `Property` FROM `Property` WHERE `Property`='AudioPolicyFullRemove' AND `Value`='0'")
+            || !MsiQueryHasRow(
+              database,
+              "SELECT `Property` FROM `Property` WHERE `Property`='AudioPolicySecurityCABinarySha256' AND `Value`='"
+              + binarySha256 + "'")
+            || exactActions.Any(predicate => !MsiQueryHasRow(
+              database,
+              "SELECT `Action` FROM `CustomAction` WHERE " + predicate))) {
+          return false;
+        }
+
+        var installFiles = TryReadMsiSequence(database, "InstallFiles");
+        var installInitialize = TryReadMsiSequence(database, "InstallInitialize");
+        var removeFiles = TryReadMsiSequence(database, "RemoveFiles");
+        var removeExistingProducts = TryReadMsiSequence(database, "RemoveExistingProducts");
+        var prepare = TryReadMsiSequence(
+          database,
+          "PrepareAudioPolicyInstallTreeSecurity");
+        var protect = TryReadMsiSequence(
+          database,
+          "ProtectAudioPolicyInstallTreeSecurity");
+        var verify = TryReadMsiSequence(
+          database,
+          "VerifyAudioPolicyUninstallTreeSecurity");
+        var prepareUpgrade = TryReadMsiSequence(
+          database,
+          "PrepareAudioPolicyUpgradeSecurity");
+        var rollback = TryReadMsiSequence(
+          database,
+          "RollbackAudioPolicyInstallTreeSecurity");
+        var commit = TryReadMsiSequence(
+          database,
+          "CommitAudioPolicyInstallTreeSecurity");
+        var startServices = TryReadMsiSequence(database, "StartServices");
+        var exactSequenceConditions = new[] {
+          "`Action`='PrepareAudioPolicyInstallTreeSecurity' AND `Condition`='NOT WIX_UPGRADE_DETECTED'",
+          "`Action`='PrepareAudioPolicyUpgradeSecurity' AND `Condition`='WIX_UPGRADE_DETECTED'",
+          "`Action`='RollbackAudioPolicyInstallTreeSecurity' AND `Condition`='AudioPolicyProtectRequired = \"1\" AND AudioPolicyTrustedInstallRoot = \"1\"'",
+          "`Action`='ProtectAudioPolicyInstallTreeSecurity' AND `Condition`='AudioPolicyProtectRequired = \"1\" AND AudioPolicyTrustedInstallRoot = \"1\"'",
+          "`Action`='CommitAudioPolicyInstallTreeSecurity' AND `Condition`='AudioPolicyProtectRequired = \"1\" AND AudioPolicyTrustedInstallRoot = \"1\"'",
+          "`Action`='VerifyAudioPolicyUninstallTreeSecurity' AND `Condition`='AudioPolicyFullRemove = \"1\" AND NOT UPGRADINGPRODUCTCODE AND AudioPolicyTrustedInstallRoot = \"1\"'"
+        };
+        return installInitialize.HasValue && installFiles.HasValue && removeFiles.HasValue &&
+          removeExistingProducts.HasValue && prepare.HasValue && prepareUpgrade.HasValue &&
+          rollback.HasValue && protect.HasValue && commit.HasValue && verify.HasValue &&
+          startServices.HasValue &&
+          exactSequenceConditions.All(predicate => MsiQueryHasRow(
+            database,
+            "SELECT `Action` FROM `InstallExecuteSequence` WHERE " + predicate)) &&
+          prepare.Value > installInitialize.Value &&
+          prepare.Value < installFiles.Value &&
+          prepareUpgrade.Value > installInitialize.Value &&
+          prepareUpgrade.Value < removeExistingProducts.Value &&
+          removeExistingProducts.Value < installFiles.Value &&
+          rollback.Value > installFiles.Value &&
+          protect.Value > rollback.Value &&
+          commit.Value > protect.Value &&
+          protect.Value > installFiles.Value &&
+          protect.Value < startServices.Value &&
+          verify.Value < removeFiles.Value;
+      } catch {
+        return false;
+      } finally {
+        if (database != IntPtr.Zero) {
+          MsiCloseHandle(database);
+        }
+      }
+    }
+
     private static StashedVibeshinePayload TryStashInstalledProductPayload(
       InstalledProductInfo installedProduct,
       string logPhase) {
@@ -6481,22 +6999,9 @@ namespace VibepolloInstaller {
       out StashedVibeshinePayload stashedPayload) {
       stashedPayload = null;
       var installedVibeshine = GetInstalledVibeshineProduct();
-      if (!RequiresPreUninstallDowngradeWorkaround(installedVibeshine, msiPath)) {
-        return null;
-      }
-
-      stashedPayload = TryStashInstalledProductPayload(installedVibeshine, logPhase + "_stash");
-      if (stashedPayload == null) {
-        return BuildRollbackPreservationFailure(installedVibeshine);
-      }
-      return UninstallInstalledProducts(
-        logPhase,
-        hiddenWindow,
-        requestElevationIfNeeded,
-        false,
-        false,
-        false,
-        new[] { InstalledProductKind.Vibeshine });
+      return RequiresPreUninstallDowngradeWorkaround(installedVibeshine, msiPath)
+        ? ManualLegacyRemovalRequired(BuildProductDisplayName(installedVibeshine))
+        : null;
     }
 
     private static InstallerResult TryPreUninstallProblematicUpgradeSourceVersion(
@@ -6505,24 +7010,9 @@ namespace VibepolloInstaller {
       bool requestElevationIfNeeded,
       out StashedVibeshinePayload stashedPayload) {
       stashedPayload = null;
-      var installedVibepollo = GetInstalledVibepolloProduct();
-      if (!RequiresPreUninstallUpgradeWorkaround(installedVibepollo)) {
-        return null;
-      }
-
-      stashedPayload = TryStashInstalledProductPayload(installedVibepollo, logPhase + "_stash");
-      if (stashedPayload == null) {
-        return BuildRollbackPreservationFailure(installedVibepollo);
-      }
-      return UninstallInstalledProducts(
-        logPhase,
-        hiddenWindow,
-        requestElevationIfNeeded,
-        false,
-        false,
-        false,
-        new[] { InstalledProductKind.Vibepollo });
+      return null;
     }
+
 
     private static bool RequiresPreUninstallDowngradeWorkaround(InstalledProductInfo installedProduct, string msiPath) {
       if (installedProduct == null || installedProduct.Kind != InstalledProductKind.Vibeshine || installedProduct.Version == null) {
@@ -6589,109 +7079,24 @@ namespace VibepolloInstaller {
       string logPhase,
       bool hiddenWindow,
       bool requestElevationIfNeeded) {
-      var installedProducts = GetInstalledProductRegistrations(true)
+      var conflictingProduct = GetInstalledProductRegistrations(true)
         .Where(product =>
           product.Kind == InstalledProductKind.Apollo
           || product.Kind == InstalledProductKind.Vibepollo
           || product.Kind == InstalledProductKind.Sunshine)
         .GroupBy(BuildProductRegistrationIdentity, StringComparer.OrdinalIgnoreCase)
         .Select(MergeInstalledProductGroup)
-        .ToList();
-      if (installedProducts.Count == 0) {
-        return new InstallerResult {
+        .Where(product => product.Kind != InstalledProductKind.Vibepollo)
+        .FirstOrDefault(CanUninstallProduct);
+      return conflictingProduct == null
+        ? new InstallerResult {
           Operation = InstallerOperation.Uninstall,
           ExitCode = 0,
-          Message = "No conflicting Apollo, Vibepollo, or Sunshine installation was found."
-        };
-      }
-
-      var finalCode = 0;
-      var lastLogPath = string.Empty;
-      foreach (var product in installedProducts) {
-        if (!CanUninstallProduct(product)) {
-          // Stale ARP entry with no usable uninstall command — skip rather
-          // than blocking installation over a leftover registry key.
-          continue;
+          Message = "No conflicting Apollo or Sunshine installation was found."
         }
-
-        int code;
-        string logPath = string.Empty;
-        if (product.IsWindowsInstaller && !string.IsNullOrWhiteSpace(product.ProductCode)) {
-          logPath = BuildLogPath(logPhase + "_remove");
-          lastLogPath = logPath;
-          var args = new List<string> {
-            "/x",
-            product.ProductCode,
-            "/qn",
-            "/norestart",
-            "/l*v",
-            logPath,
-            "REBOOT=ReallySuppress",
-            "SUPPRESSMSGBOXES=1"
-          };
-          AppendInstallerLogMessage(logPath, "Quiescing related services and helper processes before MSI uninstall attempt.");
-          TryStopRelatedServicesAndProcesses(logPath);
-          CleanupStaleComponentClientsForInstallLocation(product.InstallLocation, logPath);
-          code = RunMsiexec(args, hiddenWindow, requestElevationIfNeeded);
-          if (IsRecoverableMsiFirewallCleanupFailure(code, logPath)) {
-            int retryCode;
-            string retryLogPath;
-            string recoveryDetail;
-            StashedVibeshinePayload ignoredStashedPayload;
-            if (TryRunFirewallTolerantUninstall(
-              product,
-              args,
-              logPath,
-              logPhase + "_remove_firewall_cleanup_recovery",
-              hiddenWindow,
-              requestElevationIfNeeded,
-              false,
-              out retryCode,
-              out retryLogPath,
-              out recoveryDetail,
-              out ignoredStashedPayload)) {
-              code = retryCode;
-              logPath = retryLogPath;
-              lastLogPath = retryLogPath;
-            }
-          }
-          if (code == 0 || code == 3010 || code == 1605) {
-            CleanupCustomArpRegistration(product.InstallLocation, logPath);
-            ScheduleSelfDeleteAndEmptyInstallRootCleanup(product.InstallLocation, logPath);
-          }
-        } else {
-          // Never elevate non-MSI uninstall commands sourced from HKCU since
-          // those registry values are user-writable and could be tampered with.
-          var allowElevation = requestElevationIfNeeded && !product.IsPerUser;
-          code = RunUninstallCommand(product, hiddenWindow, allowElevation);
-        }
-
-        if (code == 3010) {
-          finalCode = 3010;
-          continue;
-        }
-        if (code == 0 || code == 1605) {
-          continue;
-        }
-
-        return new InstallerResult {
-          Operation = InstallerOperation.Uninstall,
-          ExitCode = code,
-          Message = BuildProductUninstallFailureMessage(product, code, logPath),
-          LogPath = logPath,
-          ProductCode = product.ProductCode ?? string.Empty,
-          ProductDisplayName = product.DisplayName ?? string.Empty,
-          ProductKind = product.Kind
-        };
-      }
-
-      return new InstallerResult {
-        Operation = InstallerOperation.Uninstall,
-        ExitCode = finalCode,
-        Message = BuildResultMessage("Uninstall", finalCode, lastLogPath),
-        LogPath = lastLogPath
-      };
+        : ManualLegacyRemovalRequired(BuildProductDisplayName(conflictingProduct));
     }
+
 
     private static InstallerResult UninstallInstalledProducts(
       string logPhase,
@@ -6721,6 +7126,19 @@ namespace VibepolloInstaller {
       var finalCode = 0;
       var lastLogPath = string.Empty;
       foreach (var product in installedProducts) {
+        if (product.IsPerUser || !product.IsWindowsInstaller) {
+          return ManualLegacyRemovalRequired(
+            product.DisplayName ?? "a per-user or non-MSI product");
+        }
+        var cachedPackage = TryGetProductLocalPackagePath(product.ProductCode);
+        var releasedPayload = OpenPinnedReleasedMsiPayload(
+          cachedPackage,
+          product.ProductCode);
+        if (releasedPayload == null) {
+          return ManualLegacyRemovalRequired(
+            BuildProductDisplayName(product));
+        }
+        using (releasedPayload) {
         var logPath = BuildLogPath(logPhase + "_remove");
         lastLogPath = logPath;
 
@@ -6741,7 +7159,7 @@ namespace VibepolloInstaller {
         TryStopRelatedServicesAndProcesses(logPath);
         CleanupStaleComponentClientsForInstallLocation(product.InstallLocation, logPath);
 
-        var code = RunMsiexec(args, hiddenWindow, requestElevationIfNeeded);
+        var code = RunMsiexec(args, hiddenWindow, requestElevationIfNeeded, releasedPayload);
         if (IsRecoverableMsiFirewallCleanupFailure(code, logPath)) {
           int retryCode;
           string retryLogPath;
@@ -6788,6 +7206,7 @@ namespace VibepolloInstaller {
           ProductDisplayName = product.DisplayName ?? string.Empty,
           ProductKind = product.Kind
         };
+      }
       }
 
       return new InstallerResult {
@@ -6995,26 +7414,506 @@ namespace VibepolloInstaller {
       return message;
     }
 
-    private static string ResolveMsiPath(string overridePath, bool forceFreshExtract = false) {
-      if (!string.IsNullOrWhiteSpace(overridePath)) {
-        var explicitPath = Path.GetFullPath(overridePath);
-        if (!File.Exists(explicitPath)) {
-          throw new FileNotFoundException("Specified MSI payload was not found.", explicitPath);
+    private static bool IsTrustedInstallerCacheIdentity(IdentityReference identity) {
+      var sid = identity as SecurityIdentifier;
+      if (sid == null) {
+        try {
+          sid = (SecurityIdentifier)identity.Translate(typeof(SecurityIdentifier));
+        } catch {
+          return false;
         }
-        return ValidateResolvedMsiPayload(explicitPath);
+      }
+      return sid.IsWellKnown(WellKnownSidType.LocalSystemSid)
+        || sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)
+        || string.Equals(
+          sid.Value,
+          "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+          StringComparison.Ordinal);
+    }
+
+    private static bool InstallerCacheSecurityIsSafe(
+      FileSystemSecurity security,
+      bool strictMutationCheck,
+      bool requireProtected = true) {
+      if (security == null || (requireProtected && !security.AreAccessRulesProtected) ||
+          !IsTrustedInstallerCacheIdentity(security.GetOwner(typeof(SecurityIdentifier)))) {
+        return false;
+      }
+      const FileSystemRights namespaceDanger =
+        FileSystemRights.Delete |
+        FileSystemRights.DeleteSubdirectoriesAndFiles |
+        FileSystemRights.ChangePermissions |
+        FileSystemRights.TakeOwnership;
+      const FileSystemRights mutationDanger =
+        namespaceDanger |
+        FileSystemRights.CreateFiles |
+        FileSystemRights.CreateDirectories |
+        FileSystemRights.Write |
+        FileSystemRights.WriteAttributes |
+        FileSystemRights.WriteExtendedAttributes |
+        FileSystemRights.Modify |
+        FileSystemRights.FullControl;
+      var danger = strictMutationCheck ? mutationDanger : namespaceDanger;
+      foreach (FileSystemAccessRule rule in security.GetAccessRules(
+        true,
+        true,
+        typeof(SecurityIdentifier))) {
+        if (rule.AccessControlType != AccessControlType.Allow ||
+            IsTrustedInstallerCacheIdentity(rule.IdentityReference)) {
+          continue;
+        }
+        if ((rule.PropagationFlags & PropagationFlags.InheritOnly) != 0 &&
+            !strictMutationCheck) {
+          continue;
+        }
+        if ((rule.FileSystemRights & danger) != 0) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    private static string NormalizeFinalHandlePath(string path) {
+      var normalized = path ?? string.Empty;
+      if (normalized.StartsWith(@"\\?\", StringComparison.Ordinal)) {
+        normalized = normalized.Substring(4);
+      }
+      return Path.GetFullPath(normalized)
+        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    private static bool HandlePathMatches(SafeFileHandle handle, string expectedPath) {
+      if (handle == null || handle.IsInvalid || string.IsNullOrWhiteSpace(expectedPath)) {
+        return false;
+      }
+      var capacity = 512u;
+      for (var attempt = 0; attempt < 3; attempt++) {
+        var buffer = new StringBuilder((int)capacity);
+        var written = GetFinalPathNameByHandle(
+          handle,
+          buffer,
+          capacity,
+          FileNameNormalized | VolumeNameDos);
+        if (written == 0) {
+          return false;
+        }
+        if (written < capacity) {
+          return string.Equals(
+            NormalizeFinalHandlePath(buffer.ToString()),
+            Path.GetFullPath(expectedPath).TrimEnd(
+              Path.DirectorySeparatorChar,
+              Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
+        }
+        capacity = written + 1;
+      }
+      return false;
+    }
+
+    private static SafeFileHandle OpenPinnedInstallerDirectory(string path) {
+      var handle = CreateFile(
+        path,
+        ReadControl | FileReadAttributes,
+        FileShareRead | FileShareWrite,
+        IntPtr.Zero,
+        OpenExisting,
+        FileFlagBackupSemantics | FileFlagOpenReparsePoint,
+        IntPtr.Zero);
+      if (handle == null || handle.IsInvalid) {
+        if (handle != null) {
+          handle.Dispose();
+        }
+        return null;
+      }
+      ByHandleFileInformation information;
+      if (!GetFileInformationByHandle(handle, out information) ||
+          (information.FileAttributes & FileAttributeReparsePoint) != 0 ||
+          !HandlePathMatches(handle, path)) {
+        handle.Dispose();
+        return null;
+      }
+      return handle;
+    }
+
+    private static List<SafeFileHandle> PinAndValidateInstallerCacheAncestors(
+      string leafDirectory) {
+      var windows = Path.GetFullPath(
+        Environment.GetFolderPath(Environment.SpecialFolder.Windows)).TrimEnd(
+          Path.DirectorySeparatorChar,
+          Path.AltDirectorySeparatorChar);
+      return PinAndValidateTrustedWindowsAncestors(
+        leafDirectory,
+        Path.Combine(windows, "SystemTemp"));
+    }
+
+    private static List<SafeFileHandle> PinAndValidateTrustedWindowsAncestors(
+      string leafDirectory,
+      string protectedRoot) {
+      var fullLeaf = Path.GetFullPath(leafDirectory).TrimEnd(
+        Path.DirectorySeparatorChar,
+        Path.AltDirectorySeparatorChar);
+      var windows = Path.GetFullPath(
+        Environment.GetFolderPath(Environment.SpecialFolder.Windows)).TrimEnd(
+          Path.DirectorySeparatorChar,
+          Path.AltDirectorySeparatorChar);
+      var fullProtectedRoot = Path.GetFullPath(protectedRoot).TrimEnd(
+        Path.DirectorySeparatorChar,
+        Path.AltDirectorySeparatorChar);
+      var windowsPrefix = windows + Path.DirectorySeparatorChar;
+      var requiredPrefix = fullProtectedRoot + Path.DirectorySeparatorChar;
+      if ((!string.Equals(fullProtectedRoot, windows, StringComparison.OrdinalIgnoreCase) &&
+           !fullProtectedRoot.StartsWith(windowsPrefix, StringComparison.OrdinalIgnoreCase)) ||
+          (!string.Equals(fullLeaf, fullProtectedRoot, StringComparison.OrdinalIgnoreCase) &&
+           !fullLeaf.StartsWith(requiredPrefix, StringComparison.OrdinalIgnoreCase))) {
+        return null;
+      }
+      var paths = new List<string>();
+      var cursor = fullLeaf;
+      var volumeRoot = Path.GetPathRoot(windows).TrimEnd(
+        Path.DirectorySeparatorChar,
+        Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+      for (;;) {
+        paths.Add(cursor);
+        if (string.Equals(
+              cursor.TrimEnd(Path.DirectorySeparatorChar),
+              volumeRoot.TrimEnd(Path.DirectorySeparatorChar),
+              StringComparison.OrdinalIgnoreCase)) {
+          break;
+        }
+        var parent = Directory.GetParent(cursor);
+        if (parent == null) {
+          return null;
+        }
+        cursor = parent.FullName;
+      }
+      paths.Reverse();
+      var pins = new List<SafeFileHandle>();
+      try {
+        foreach (var path in paths) {
+          if (!Directory.Exists(path)) {
+            throw new InvalidOperationException("A trusted installer-cache ancestor is missing.");
+          }
+          var pin = OpenPinnedInstallerDirectory(path);
+          if (pin == null) {
+            throw new InvalidOperationException("A trusted installer-cache ancestor could not be pinned.");
+          }
+          var strict = string.Equals(path, fullProtectedRoot, StringComparison.OrdinalIgnoreCase)
+            || path.StartsWith(requiredPrefix, StringComparison.OrdinalIgnoreCase);
+          var security = new DirectoryInfo(path).GetAccessControl(
+            AccessControlSections.Access | AccessControlSections.Owner);
+          if (!InstallerCacheSecurityIsSafe(security, strict)) {
+            pin.Dispose();
+            throw new InvalidOperationException("A trusted installer-cache ancestor has unsafe access rules.");
+          }
+          pins.Add(pin);
+        }
+        return pins;
+      } catch {
+        foreach (var pin in pins) {
+          pin.Dispose();
+        }
+        return null;
+      }
+    }
+
+    private static DirectorySecurity BuildInstallerCacheDirectorySecurity() {
+      return BuildInstallerRecoveryDirectorySecurity();
+    }
+
+    private static FileSecurity BuildInstallerCacheFileSecurity() {
+      var security = new FileSecurity();
+      security.SetAccessRuleProtection(true, false);
+      var administratorsSid = new SecurityIdentifier(
+        WellKnownSidType.BuiltinAdministratorsSid,
+        null);
+      security.SetOwner(administratorsSid);
+      security.AddAccessRule(new FileSystemAccessRule(
+        new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+        FileSystemRights.FullControl,
+        AccessControlType.Allow));
+      security.AddAccessRule(new FileSystemAccessRule(
+        administratorsSid,
+        FileSystemRights.FullControl,
+        AccessControlType.Allow));
+      return security;
+    }
+
+    private static string CreateTrustedInstallerCacheRoot() {
+      var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+      if (string.IsNullOrWhiteSpace(windows)) {
+        throw new InvalidOperationException("The Windows directory could not be resolved.");
+      }
+      var systemTemp = Path.Combine(Path.GetFullPath(windows), "SystemTemp");
+      var systemPins = PinAndValidateInstallerCacheAncestors(systemTemp);
+      if (systemPins == null) {
+        throw new InvalidOperationException("The LocalSystem temporary directory is not trusted.");
+      }
+      foreach (var pin in systemPins) {
+        pin.Dispose();
       }
 
-      // Prefer the embedded payload to avoid stale sidecar MSI files overriding the
-      // version and install target unexpectedly. Sidecar remains a fallback.
-      try {
-        return ValidateResolvedMsiPayload(ExtractEmbeddedMsi(forceFreshExtract));
-      } catch {
-        var sidecarMsi = FindSidecarMsi();
-        if (!string.IsNullOrWhiteSpace(sidecarMsi)) {
-          return ValidateResolvedMsiPayload(sidecarMsi);
+      // Never reuse or repair a predictable cache directory. A pre-existing
+      // path could be a junction or carry an attacker-selected descriptor.
+      // A fresh, non-reparse leaf under the already pinned SystemTemp parent
+      // is the per-process trust root for every payload passed to msiexec.
+      for (var attempt = 0; attempt < 8; attempt++) {
+        var root = Path.Combine(
+          systemTemp,
+          "VibepolloInstallerCache_" + Guid.NewGuid().ToString("N"));
+        if (Directory.Exists(root) || File.Exists(root)) {
+          continue;
         }
-        throw;
+        var rootInfo = new DirectoryInfo(root);
+        rootInfo.Create(BuildInstallerCacheDirectorySecurity());
+        var pins = PinAndValidateInstallerCacheAncestors(root);
+        if (pins == null) {
+          throw new InvalidOperationException("The fresh installer-cache root is not trusted.");
+        }
+        foreach (var pin in pins) {
+          pin.Dispose();
+        }
+        return root;
       }
+      throw new InvalidOperationException("A fresh installer-cache root could not be created.");
+    }
+
+    private static string GetTrustedInstallerCacheRoot() {
+      return TrustedInstallerCacheRoot.Value;
+    }
+
+    private static void CreateProtectedInstallerCacheDirectory(string path) {
+      if (!IsProcessElevated()) {
+        Directory.CreateDirectory(path);
+        return;
+      }
+      var root = GetTrustedInstallerCacheRoot();
+      var fullPath = Path.GetFullPath(path);
+      if (!string.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase) &&
+          !fullPath.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) {
+        throw new InvalidOperationException("The MSI cache path escaped its trusted root.");
+      }
+      var info = new DirectoryInfo(fullPath);
+      if (!info.Exists) {
+        info.Create(BuildInstallerCacheDirectorySecurity());
+      }
+      info.SetAccessControl(BuildInstallerCacheDirectorySecurity());
+      var pins = PinAndValidateInstallerCacheAncestors(fullPath);
+      if (pins == null) {
+        throw new InvalidOperationException("The MSI cache directory is not trusted.");
+      }
+      foreach (var pin in pins) {
+        pin.Dispose();
+      }
+    }
+
+    private static void SetProtectedInstallerCacheFileSecurity(string path) {
+      if (IsProcessElevated()) {
+        new FileInfo(path).SetAccessControl(BuildInstallerCacheFileSecurity());
+      }
+    }
+
+    private static string ComputePinnedStreamSha256Hex(FileStream stream) {
+      if (stream == null || !stream.CanSeek) {
+        throw new InvalidOperationException("The MSI payload stream cannot be hashed.");
+      }
+      var original = stream.Position;
+      try {
+        stream.Position = 0;
+        using (var hasher = SHA256.Create()) {
+          return string.Concat(hasher.ComputeHash(stream).Select(b => b.ToString("x2")));
+        }
+      } finally {
+        stream.Position = original;
+      }
+    }
+
+    private static void RegisterApprovedPayload(string path, string sha256) {
+      var fullPath = Path.GetFullPath(path);
+      lock (ApprovedPayloadLock) {
+        ApprovedPayloadHashes[fullPath] = sha256;
+      }
+    }
+
+    private static PinnedMsiPayload OpenPinnedMsiPayload(
+      string path,
+      string expectedSha256 = null) {
+      var fullPath = Path.GetFullPath(path);
+      var directory = Path.GetDirectoryName(fullPath);
+      if (string.IsNullOrWhiteSpace(directory)) {
+        return null;
+      }
+      var ancestorPins = IsProcessElevated()
+        ? PinAndValidateInstallerCacheAncestors(directory)
+        : new List<SafeFileHandle>();
+      if (ancestorPins == null) {
+        return null;
+      }
+      FileStream stream = null;
+      try {
+        stream = new FileStream(
+          fullPath,
+          FileMode.Open,
+          FileAccess.Read,
+          FileShare.Read);
+        ByHandleFileInformation information;
+        if (!GetFileInformationByHandle(stream.SafeFileHandle, out information) ||
+            (information.FileAttributes & FileAttributeReparsePoint) != 0 ||
+            information.NumberOfLinks != 1 ||
+            !HandlePathMatches(stream.SafeFileHandle, fullPath)) {
+          throw new InvalidDataException("The MSI payload identity is unsafe.");
+        }
+        var actualSha256 = ComputePinnedStreamSha256Hex(stream);
+        if (string.IsNullOrWhiteSpace(expectedSha256)) {
+          lock (ApprovedPayloadLock) {
+            ApprovedPayloadHashes.TryGetValue(fullPath, out expectedSha256);
+          }
+        }
+        if (string.IsNullOrWhiteSpace(expectedSha256) ||
+            !string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase)) {
+          throw new InvalidDataException("The MSI payload digest changed.");
+        }
+        return new PinnedMsiPayload(fullPath, actualSha256, stream, ancestorPins);
+      } catch {
+        if (stream != null) {
+          stream.Dispose();
+        }
+        foreach (var pin in ancestorPins) {
+          pin.Dispose();
+        }
+        return null;
+      }
+    }
+
+    private static PinnedMsiPayload OpenPinnedReleasedMsiPayload(
+      string path,
+      string expectedProductCode) {
+      if (string.IsNullOrWhiteSpace(path)) {
+        return null;
+      }
+      var normalizedExpectedProductCode = NormalizeProductCode(expectedProductCode);
+      if (!LooksLikeProductCode(normalizedExpectedProductCode)) {
+        return null;
+      }
+      var fullPath = Path.GetFullPath(path);
+      var directory = Path.GetDirectoryName(fullPath);
+      var windows = Path.GetFullPath(
+        Environment.GetFolderPath(Environment.SpecialFolder.Windows)).TrimEnd(
+          Path.DirectorySeparatorChar,
+          Path.AltDirectorySeparatorChar);
+      var installerCache = Path.Combine(windows, "Installer");
+      if (string.IsNullOrWhiteSpace(directory) ||
+          (!string.Equals(directory, installerCache, StringComparison.OrdinalIgnoreCase) &&
+           !directory.StartsWith(
+             installerCache + Path.DirectorySeparatorChar,
+             StringComparison.OrdinalIgnoreCase))) {
+        return null;
+      }
+      var ancestorPins = PinAndValidateTrustedWindowsAncestors(
+        directory,
+        installerCache);
+      if (ancestorPins == null) {
+        return null;
+      }
+      FileStream stream = null;
+      try {
+        stream = new FileStream(
+          fullPath,
+          FileMode.Open,
+          FileAccess.Read,
+          FileShare.Read);
+        ByHandleFileInformation information;
+        var security = new FileInfo(fullPath).GetAccessControl(
+          AccessControlSections.Access | AccessControlSections.Owner);
+        if (!GetFileInformationByHandle(stream.SafeFileHandle, out information) ||
+            (information.FileAttributes & FileAttributeReparsePoint) != 0 ||
+            information.NumberOfLinks != 1 ||
+            !HandlePathMatches(stream.SafeFileHandle, fullPath) ||
+            !InstallerCacheSecurityIsSafe(security, true, false)) {
+          throw new InvalidDataException("The cached MSI identity is unsafe.");
+        }
+        var sha256 = ComputePinnedStreamSha256Hex(stream);
+        if (!MsiPackageContainsNativeTrustBoundary(fullPath)) {
+          throw new InvalidDataException("The cached MSI is not an approved released artifact.");
+        }
+        var payloadInfo = TryGetPayloadMsiInfo(fullPath);
+        var actualProductCode = NormalizeProductCode(
+          payloadInfo == null ? null : payloadInfo.ProductCode);
+        if (!string.Equals(
+              actualProductCode,
+              normalizedExpectedProductCode,
+              StringComparison.OrdinalIgnoreCase)) {
+          throw new InvalidDataException("The cached MSI ProductCode does not match its registration.");
+        }
+        return new PinnedMsiPayload(
+          fullPath,
+          sha256,
+          stream,
+          ancestorPins,
+          actualProductCode);
+      } catch {
+        if (stream != null) {
+          stream.Dispose();
+        }
+        foreach (var pin in ancestorPins) {
+          pin.Dispose();
+        }
+        return null;
+      }
+    }
+
+    private static string StageDeveloperMsiOverride(string overridePath) {
+      var explicitPath = Path.GetFullPath(overridePath);
+      if (!File.Exists(explicitPath)) {
+        throw new FileNotFoundException("Specified MSI payload was not found.", explicitPath);
+      }
+      var embeddedPath = ExtractEmbeddedMsi(true, false);
+      var expectedBinarySha256 = ComputeMsiBinaryStreamSha256Hex(embeddedPath);
+      if (string.IsNullOrWhiteSpace(expectedBinarySha256)) {
+        throw new InvalidDataException("The embedded MSI trust-boundary digest is unavailable.");
+      }
+      using (var source = new FileStream(
+        explicitPath,
+        FileMode.Open,
+        FileAccess.Read,
+        FileShare.Read)) {
+        ByHandleFileInformation information;
+        if (!GetFileInformationByHandle(source.SafeFileHandle, out information) ||
+            (information.FileAttributes & FileAttributeReparsePoint) != 0 ||
+            information.NumberOfLinks != 1 ||
+            !HandlePathMatches(source.SafeFileHandle, explicitPath)) {
+          throw new InvalidDataException(
+            "The developer MSI source identity is unsafe.");
+        }
+        var sourceHash = ComputePinnedStreamSha256Hex(source);
+        var destinationDirectory = BuildEmbeddedMsiExtractDirectory(sourceHash, true);
+        CreateProtectedInstallerCacheDirectory(destinationDirectory);
+        var destination = Path.Combine(destinationDirectory, "Vibepollo.developer.msi");
+        source.Position = 0;
+        WriteStreamAtomically(source, destination);
+        RegisterApprovedPayload(destination, sourceHash);
+        using (var staged = OpenPinnedMsiPayload(destination, sourceHash)) {
+          if (staged == null ||
+              !MsiPackageContainsNativeTrustBoundary(
+                destination,
+                expectedBinarySha256,
+                false)) {
+            throw new InvalidDataException("The staged developer MSI changed during validation.");
+          }
+        }
+        return destination;
+      }
+    }
+
+    private static string ResolveMsiPath(string overridePath, bool forceFreshExtract = false) {
+      if (!string.IsNullOrWhiteSpace(overridePath)) {
+        if (!IsProcessElevated()) {
+          throw new InvalidOperationException(
+            "A developer MSI override is accepted only from an already elevated process.");
+        }
+        return StageDeveloperMsiOverride(overridePath);
+      }
+
+      return ValidateResolvedMsiPayload(ExtractEmbeddedMsi(forceFreshExtract, true));
     }
 
     private static string ValidateResolvedMsiPayload(string msiPath) {
@@ -7026,48 +7925,37 @@ namespace VibepolloInstaller {
       return msiPath;
     }
 
-    private static string FindSidecarMsi() {
-      var baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
-      var msiFiles = Directory.Exists(baseDirectory)
-        ? Directory.GetFiles(baseDirectory, "*.msi")
-        : new string[0];
-      return msiFiles
-        .OrderByDescending(File.GetLastWriteTimeUtc)
-        .FirstOrDefault();
-    }
-
-    private static string ExtractEmbeddedMsi(bool forceFreshExtract = false) {
+    private static string ExtractEmbeddedMsi(
+      bool forceFreshExtract = false,
+      bool requireReleasedSigner = true) {
+      if (requireReleasedSigner && !IsAuthenticodeTrustValid(
+            Assembly.GetExecutingAssembly().Location)) {
+        throw new InvalidDataException(
+          "The bootstrapper Authenticode signature is missing or invalid.");
+      }
       using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("Payload.msi")) {
         if (stream == null) {
           throw new InvalidOperationException(
             "No MSI payload was found. The installer may be corrupted.\n\n"
-            + "Try re-downloading the installer from the Vibepollo releases page, "
-            + "or use the --msi option to specify a payload manually.");
+            + "Try re-downloading the installer from the Vibepollo releases page.");
         }
 
         var versionToken = ComputeStreamSha256Hex(stream);
         var extractDirectory = BuildEmbeddedMsiExtractDirectory(versionToken, forceFreshExtract);
-        Directory.CreateDirectory(extractDirectory);
+        CreateProtectedInstallerCacheDirectory(extractDirectory);
 
         var msiPath = Path.Combine(extractDirectory, "Vibepollo.msi");
-        var shouldWrite = forceFreshExtract
-          || !File.Exists(msiPath)
-          || new FileInfo(msiPath).Length != stream.Length
-          || !FileHashMatches(msiPath, versionToken);
-        if (shouldWrite) {
-          WriteStreamAtomically(stream, msiPath);
-        }
+        WriteStreamAtomically(stream, msiPath);
+        RegisterApprovedPayload(msiPath, versionToken);
 
-        if (!WaitForMsiPackageAvailability(msiPath, 12, 250)) {
-          if (!forceFreshExtract) {
-            TryDeleteFile(msiPath);
-            return ExtractEmbeddedMsi(true);
-          }
-
+        using (var pinned = OpenPinnedMsiPayload(msiPath, versionToken)) {
+          if (pinned == null || !MsiPackageContainsNativeTrustBoundary(
+                msiPath,
+                null,
+                requireReleasedSigner)) {
           throw new InvalidOperationException(
-            "The extracted MSI payload could not be opened by Windows Installer.\n\n"
-            + "The bootstrapper removed the stale payload and re-extracted a fresh copy, "
-            + "but Windows still could not open it.");
+              "The exact embedded MSI payload did not pass its native trust-boundary inspection.");
+          }
         }
 
         return msiPath;
@@ -7075,21 +7963,17 @@ namespace VibepolloInstaller {
     }
 
     private static string BuildEmbeddedMsiExtractDirectory(string versionToken, bool forceFreshExtract) {
-      var root = Path.Combine(GetEmbeddedMsiExtractRoot(), versionToken);
-      if (!forceFreshExtract) {
-        return root;
-      }
-
-      return Path.Combine(root, "recovery_" + Guid.NewGuid().ToString("N"));
+      var token = string.IsNullOrWhiteSpace(versionToken)
+        ? "unknown"
+        : versionToken.Substring(0, Math.Min(16, versionToken.Length));
+      return Path.Combine(
+        GetEmbeddedMsiExtractRoot(),
+        "payload_" + token + "_" + Guid.NewGuid().ToString("N"));
     }
 
     private static string GetEmbeddedMsiExtractRoot() {
-      // Windows Installer may run in the service context and fail to read per-user temp payloads.
       if (IsProcessElevated()) {
-        var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-        if (!string.IsNullOrWhiteSpace(programData)) {
-          return Path.Combine(programData, "Vibepollo", "InstallerCache");
-        }
+        return GetTrustedInstallerCacheRoot();
       }
 
       return Path.Combine(Path.GetTempPath(), "VibepolloInstaller");
@@ -7100,9 +7984,8 @@ namespace VibepolloInstaller {
         Path.Combine(Path.GetTempPath(), "VibepolloInstaller")
       };
 
-      var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-      if (!string.IsNullOrWhiteSpace(programData)) {
-        roots.Add(Path.Combine(programData, "Vibepollo", "InstallerCache"));
+      if (IsProcessElevated()) {
+        roots.Add(GetTrustedInstallerCacheRoot());
       }
 
       return roots;
@@ -7118,18 +8001,15 @@ namespace VibepolloInstaller {
         throw new InvalidOperationException("The MSI extraction directory is invalid.");
       }
 
-      Directory.CreateDirectory(destinationDirectory);
+      CreateProtectedInstallerCacheDirectory(destinationDirectory);
       var tempPath = destinationPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
       try {
         input.Position = 0;
-        using (var output = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None)) {
+        using (var output = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
           input.CopyTo(output);
-          output.Flush();
+          output.Flush(true);
         }
-
-        if (File.Exists(destinationPath)) {
-          File.Delete(destinationPath);
-        }
+        SetProtectedInstallerCacheFileSecurity(tempPath);
         File.Move(tempPath, destinationPath);
       } finally {
         TryDeleteFile(tempPath);
@@ -7630,17 +8510,12 @@ namespace VibepolloInstaller {
       string installDirectory,
       bool installVirtualDisplayDriver,
       bool saveInstallLogs) {
-      string normalizedMsiOverride = null;
       if (!string.IsNullOrWhiteSpace(arguments.MsiPathOverride)) {
-        try {
-          normalizedMsiOverride = ResolveMsiPath(arguments.MsiPathOverride);
-        } catch (Exception ex) {
-          return new InstallerResult {
-            Operation = InstallerOperation.Install,
-            ExitCode = 1603,
-            Message = "The installer could not resolve a valid MSI payload: " + ex.Message
-          };
-        }
+        return new InstallerResult {
+          Operation = InstallerOperation.Install,
+          ExitCode = 1603,
+          Message = "The bootstrapper will not self-elevate a caller-selected MSI."
+        };
       }
       var resultPath = Path.Combine(Path.GetTempPath(), "vibeshine_install_result_" + Guid.NewGuid().ToString("N") + ".txt");
       var elevatedArgs = new List<string> {
@@ -7654,11 +8529,6 @@ namespace VibepolloInstaller {
         "--internal-install-result-path",
         resultPath
       };
-      if (!string.IsNullOrWhiteSpace(normalizedMsiOverride)) {
-        elevatedArgs.Add("--msi");
-        elevatedArgs.Add(normalizedMsiOverride);
-      }
-
       var exitCode = RunElevatedBootstrapper(elevatedArgs);
       var snapshot = TryReadInternalInstallResult(resultPath);
       var installLogPath = FindMostRecentLog(Path.GetTempPath(), "vibeshine_install_*.log");
@@ -7684,6 +8554,13 @@ namespace VibepolloInstaller {
     private static InstallerResult RunElevatedBootstrapperCli(
       InstallerArguments arguments,
       IReadOnlyList<string> normalizedCliArgs = null) {
+      if (!string.IsNullOrWhiteSpace(arguments.MsiPathOverride)) {
+        return new InstallerResult {
+          Operation = InstallerOperation.Install,
+          ExitCode = 1603,
+          Message = "The bootstrapper will not self-elevate a caller-selected MSI."
+        };
+      }
       var forwardedArguments = normalizedCliArgs == null
         ? new List<string>(arguments.ForwardedArguments)
         : new List<string>(normalizedCliArgs);
@@ -7696,10 +8573,6 @@ namespace VibepolloInstaller {
         "--internal-install-result-path",
         resultPath
       };
-      if (normalizedCliArgs == null && !string.IsNullOrWhiteSpace(arguments.MsiPathOverride)) {
-        elevatedArgs.Add("--msi");
-        elevatedArgs.Add(arguments.MsiPathOverride);
-      }
       elevatedArgs.AddRange(forwardedArguments);
 
       var exitCode = RunElevatedBootstrapper(elevatedArgs);
@@ -7731,6 +8604,13 @@ namespace VibepolloInstaller {
       InstallerArguments arguments,
       bool factoryResetAppData,
       bool removeVirtualDisplayDriver) {
+      if (!string.IsNullOrWhiteSpace(arguments.MsiPathOverride)) {
+        return new InstallerResult {
+          Operation = InstallerOperation.Uninstall,
+          ExitCode = 1603,
+          Message = "MSI overrides are not accepted for uninstall."
+        };
+      }
       var elevatedArgs = new List<string> {
         "--internal-elevated-uninstall",
         "--internal-uninstall-factory-reset",
@@ -7738,11 +8618,6 @@ namespace VibepolloInstaller {
         "--internal-uninstall-remove-virtual-display-driver",
         removeVirtualDisplayDriver ? "1" : "0"
       };
-      if (!string.IsNullOrWhiteSpace(arguments.MsiPathOverride)) {
-        elevatedArgs.Add("--msi");
-        elevatedArgs.Add(arguments.MsiPathOverride);
-      }
-
       var exitCode = RunElevatedBootstrapper(elevatedArgs);
       var uninstallLogPath = FindMostRecentLog(Path.GetTempPath(), "vibeshine_uninstall_*.log")
         ?? FindMostRecentLog(Path.GetTempPath(), "vibeshine_uninstall_remove_*.log");
@@ -7892,15 +8767,167 @@ namespace VibepolloInstaller {
       }
     }
 
+    private static PinnedMsiPayload OpenPinnedMsiForExecution(
+      IReadOnlyList<string> arguments) {
+      if (arguments == null) {
+        return null;
+      }
+      for (var index = 0; index < arguments.Count; index++) {
+        var operation = arguments[index];
+        if (!string.Equals(operation, "/i", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(operation, "/package", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(operation, "/x", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(operation, "/f", StringComparison.OrdinalIgnoreCase)) {
+          continue;
+        }
+        if (index + 1 >= arguments.Count || LooksLikeSwitch(arguments[index + 1])) {
+          return null;
+        }
+        var target = (arguments[index + 1] ?? string.Empty).Trim().Trim('"');
+        var productCode = NormalizeProductCode(target);
+        if ((string.Equals(operation, "/x", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(operation, "/f", StringComparison.OrdinalIgnoreCase)) &&
+            LooksLikeProductCode(productCode)) {
+          return OpenPinnedReleasedMsiPayload(
+            TryGetProductLocalPackagePath(productCode),
+            productCode);
+        }
+
+        string expectedSha256;
+        var fullPath = Path.GetFullPath(target);
+        lock (ApprovedPayloadLock) {
+          ApprovedPayloadHashes.TryGetValue(fullPath, out expectedSha256);
+        }
+        return string.IsNullOrWhiteSpace(expectedSha256)
+          ? null
+          : OpenPinnedMsiPayload(fullPath, expectedSha256);
+      }
+      return null;
+    }
+
+    private static PinnedMsiPayload OpenPinnedRegisteredMaintenancePayload(
+      IReadOnlyList<string> arguments) {
+      if (!IsRegisteredMaintenanceOperation(arguments)) {
+        return null;
+      }
+      return OpenPinnedMsiForExecution(arguments);
+    }
+
+    private static bool TryValidatePinnedMsiExecutionTarget(
+      IReadOnlyList<string> arguments,
+      PinnedMsiPayload pinnedPayload,
+      out List<string> validatedArguments) {
+      validatedArguments = null;
+      if (pinnedPayload == null || string.IsNullOrWhiteSpace(pinnedPayload.Path)) {
+        return false;
+      }
+
+      int operationIndex;
+      int targetIndex;
+      string operation;
+      string target;
+      if (!TryGetSoleMsiOperationTarget(
+            arguments,
+            out operationIndex,
+            out operation,
+            out targetIndex,
+            out target)) {
+        return false;
+      }
+      for (var index = 0; index < arguments.Count; index++) {
+        if (index == operationIndex || index == targetIndex) {
+          continue;
+        }
+        var token = (arguments[index] ?? string.Empty).Trim().Trim('"');
+        if (IsOperationSwitch(token) || LooksLikeAdditionalMsiTarget(token)) {
+          return false;
+        }
+      }
+
+      validatedArguments = new List<string>(arguments);
+      if (string.Equals(operation, "/x", StringComparison.OrdinalIgnoreCase) ||
+          string.Equals(operation, "/f", StringComparison.OrdinalIgnoreCase)) {
+        var normalizedProductCode = NormalizeProductCode(target);
+        if (!LooksLikeProductCode(normalizedProductCode) ||
+            !string.Equals(
+              normalizedProductCode,
+              pinnedPayload.ProductCode,
+              StringComparison.OrdinalIgnoreCase)) {
+          validatedArguments = null;
+          return false;
+        }
+        string registeredPath;
+        try {
+          registeredPath = Path.GetFullPath(
+            TryGetProductLocalPackagePath(normalizedProductCode));
+        } catch {
+          validatedArguments = null;
+          return false;
+        }
+        if (!string.Equals(
+              registeredPath,
+              pinnedPayload.Path,
+              StringComparison.OrdinalIgnoreCase)) {
+          validatedArguments = null;
+          return false;
+        }
+
+        // Execute the exact cache file held by pinnedPayload rather than asking
+        // msiexec to resolve the mutable ProductCode registration a second time.
+        validatedArguments[targetIndex] = pinnedPayload.Path;
+        return true;
+      }
+
+      if (!string.Equals(operation, "/i", StringComparison.OrdinalIgnoreCase) &&
+          !string.Equals(operation, "/package", StringComparison.OrdinalIgnoreCase)) {
+        validatedArguments = null;
+        return false;
+      }
+      string targetPath;
+      try {
+        targetPath = Path.GetFullPath(target);
+      } catch {
+        validatedArguments = null;
+        return false;
+      }
+      if (!string.Equals(targetPath, pinnedPayload.Path, StringComparison.OrdinalIgnoreCase)) {
+        validatedArguments = null;
+        return false;
+      }
+      validatedArguments[targetIndex] = pinnedPayload.Path;
+      return true;
+    }
+
     private static int RunMsiexec(IReadOnlyList<string> arguments, bool hiddenWindow, bool requestElevationIfNeeded) {
+      using (var pinnedPayload = OpenPinnedMsiForExecution(arguments)) {
+        return RunMsiexec(
+          arguments,
+          hiddenWindow,
+          requestElevationIfNeeded,
+          pinnedPayload);
+      }
+    }
+
+    private static int RunMsiexec(
+      IReadOnlyList<string> arguments,
+      bool hiddenWindow,
+      bool requestElevationIfNeeded,
+      PinnedMsiPayload pinnedPayload) {
+      List<string> validatedArguments;
+      if (!TryValidatePinnedMsiExecutionTarget(
+            arguments,
+            pinnedPayload,
+            out validatedArguments)) {
+        return 1603;
+      }
       return RunProcess(
         ResolveMsiexecPath(),
-        BuildCommandLine(arguments),
+        BuildCommandLine(validatedArguments),
         hiddenWindow,
         requestElevationIfNeeded,
         MsiExecTimeoutMilliseconds,
         MsiExecTimeoutExitCode,
-        TryGetMsiLogPath(arguments == null ? new List<string>() : arguments.ToList()));
+        TryGetMsiLogPath(validatedArguments));
     }
 
     private static int RunProcess(string executablePath, string arguments, bool hiddenWindow, bool requestElevationIfNeeded) {

@@ -938,6 +938,10 @@ namespace {
     if (selected_endpoint_id.empty()) {
       return "a green report requires a nonempty selected endpoint ID";
     }
+    if (input_render_device_id == selected_endpoint_id ||
+        returned_render_device_id == selected_endpoint_id) {
+      return "a green report requires WinRT DeviceIds distinct from selected_endpoint.id";
+    }
     for (const auto role : {"console", "multimedia", "communications"}) {
       const auto &default_endpoint = defaults.at(role);
       if (default_endpoint.is_null() ||

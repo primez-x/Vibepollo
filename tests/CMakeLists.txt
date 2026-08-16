@@ -426,6 +426,89 @@ sunshine_register_component(NAME test_component_virtual_display_manifest TEST_SO
 
 if(WIN32)
     sunshine_register_component(
+        NAME test_component_audio_hotfix_deployer
+        TEST_SOURCE unit/platform/windows/test_audio_hotfix_deployer.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/vibepollo_audio_hotfix_deployer_core.cpp"
+        DEFINITIONS
+            "VIBEPOLLO_AUDIO_HOTFIX_TEST_CLI_PATH=\"$<TARGET_FILE:vibepollo_audio_hotfix_deployer_test_cli>\""
+        LINK_LIBRARIES advapi32)
+    add_dependencies(test_component_audio_hotfix_deployer vibepollo_audio_hotfix_deployer_test_cli)
+
+    sunshine_register_component(
+        NAME test_component_audio_policy_msi_security
+        TEST_SOURCE unit/platform/windows/test_audio_policy_msi_security.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/packaging/windows/wix/audio_policy_security_custom_action.cpp"
+        DEFINITIONS SUNSHINE_AUDIO_POLICY_MSI_SECURITY_TESTING=1
+        LINK_LIBRARIES advapi32 msi ole32 shell32)
+
+    add_executable(sunshine_audio_policy_test_helper
+        helpers/audio_policy_blocking_helper.cpp
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/audio_policy_helper_protocol.cpp")
+    set_target_properties(sunshine_audio_policy_test_helper PROPERTIES
+        OUTPUT_NAME sunshine_audio_policy_helper
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    target_include_directories(sunshine_audio_policy_test_helper PRIVATE
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}")
+    target_link_libraries(sunshine_audio_policy_test_helper PRIVATE
+        ole32
+        mmdevapi
+        ${PLATFORM_LIBRARIES})
+    target_compile_options(sunshine_audio_policy_test_helper PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+    sunshine_register_component(
+        NAME test_component_audio_policy_process
+        TEST_SOURCE unit/platform/windows/test_audio_policy_process.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/audio_policy_helper_protocol.cpp"
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/platform/windows/audio_policy_process.cpp"
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/audio_policy_helper.cpp"
+        DEFINITIONS
+            SUNSHINE_AUDIO_POLICY_PROCESS_TESTING=1
+            SUNSHINE_AUDIO_POLICY_HELPER_TESTING=1
+            "SUNSHINE_SOURCE_DIR=\"${SUNSHINE_TEST_REPOSITORY_ROOT}\""
+        LINK_LIBRARIES advapi32 msi ole32 mmdevapi)
+    add_dependencies(test_component_audio_policy_process sunshine_audio_policy_test_helper)
+
+    sunshine_register_component(
+        NAME test_component_atmos_spatial_lock_test
+        TEST_SOURCE unit/test_atmos_spatial_lock_test.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_spatial_lock_test.cpp"
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_spatial_lock_test_windows.cpp"
+        DEFINITIONS ATMOS_SPATIAL_LOCK_TEST_NO_MAIN
+        LINK_LIBRARIES nlohmann_json::nlohmann_json ole32 windowsapp ksuser mmdevapi
+    )
+    sunshine_register_component(
+        NAME test_component_atmos_mat_direct_protocol
+        TEST_SOURCE unit/test_atmos_mat_direct_protocol.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_mat_direct_protocol.cpp"
+    )
+    sunshine_register_component(
+        NAME test_component_atmos_mat_host_relay
+        TEST_SOURCE unit/test_atmos_mat_host_relay.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_mat_host_relay.cpp"
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_mat_host_relay_windows.cpp"
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_mat_direct_protocol.cpp"
+        LINK_LIBRARIES OpenSSL::SSL OpenSSL::Crypto
+    )
+    sunshine_register_component(
+        NAME test_component_atmos_mat_client_writer
+        TEST_SOURCE unit/test_atmos_mat_client_writer.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_mat_client_writer.cpp"
+    )
+    sunshine_register_component(
+        NAME test_component_atmos_mat_direct_relay_cli
+        TEST_SOURCE unit/test_atmos_mat_direct_relay_cli.cpp
+        PRODUCT_SOURCES
+            "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_mat_direct_relay_cli.cpp"
+        LINK_LIBRARIES atmos_mat_host_relay atmos_mat_client_writer OpenSSL::SSL OpenSSL::Crypto ws2_32
+    )
+    sunshine_register_component(
         NAME test_component_atmos_capability_probe_windows
         TEST_SOURCE unit/platform/windows/test_atmos_capability_probe_windows.cpp
         PRODUCT_SOURCES

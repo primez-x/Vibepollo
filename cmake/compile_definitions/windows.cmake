@@ -136,7 +136,8 @@ foreach(_sunshine_versioned_tool IN ITEMS
         sunshinesvc
         playnite-launcher
         sunshine_wgc_capture
-        sunshine_display_helper)
+        sunshine_display_helper
+        sunshine_audio_policy_helper)
     if(TARGET "${_sunshine_versioned_tool}")
         sunshine_add_windows_versioninfo("${_sunshine_versioned_tool}")
     endif()
@@ -236,6 +237,10 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_vram.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_wgc.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/audio.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/audio_policy_helper_protocol.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/audio_policy_helper_protocol.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/audio_policy_process.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/audio_policy_process.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/virtual_display.h"
         ${SUNSHINE_WINDOWS_VDISPLAY_SOURCES}
         "${CMAKE_SOURCE_DIR}/src/platform/windows/utils.h"
@@ -279,6 +284,7 @@ set(OPENSSL_LIBRARIES
 
 list(PREPEND PLATFORM_LIBRARIES
         ${CURL_STATIC_LIBRARIES}
+        advapi32
         avrt
         d3d11
         D3DCompiler

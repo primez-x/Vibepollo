@@ -77,6 +77,12 @@ endif()
 if (TARGET sunshine_display_helper)
     install(TARGETS sunshine_display_helper RUNTIME DESTINATION "tools" COMPONENT application)
 endif()
+if (TARGET sunshine_audio_policy_helper)
+    install(TARGETS sunshine_audio_policy_helper RUNTIME DESTINATION "tools" COMPONENT application)
+endif()
+if (TARGET package_msi AND TARGET sunshine_audio_policy_helper)
+    add_dependencies(package_msi sunshine_audio_policy_helper)
+endif()
 install(FILES "${CMAKE_BINARY_DIR}/uninstall.exe" DESTINATION "." COMPONENT application)
 
 # Drivers (SudoVDA virtual display)
@@ -178,12 +184,15 @@ if(EXISTS "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_REFRESH_SCRIPT}")
     endif()
 
     add_custom_target(validate_sunshine_virtual_display_driver_assets
-        COMMAND powershell -NoLogo -NonInteractive -NoProfile -ExecutionPolicy Bypass
-                -File "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_REFRESH_SCRIPT}"
-                -ValidateOnly
-                -LibVirtualDisplayDir "${SUNSHINE_LIBVIRTUALDISPLAY_SOURCE_DIR}"
-                -PrebuiltPackageDir "${SUNSHINE_EFFECTIVE_LIBVIRTUALDISPLAY_PREBUILT_DIR}"
-                -PackageDir "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_SOURCE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E env
+                "SUNSHINE_VDD_REFRESH_SCRIPT=${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_REFRESH_SCRIPT}"
+                "SUNSHINE_VDD_LIBVIRTUALDISPLAY_DIR=${SUNSHINE_LIBVIRTUALDISPLAY_SOURCE_DIR}"
+                "SUNSHINE_VDD_PREBUILT_DIR=${SUNSHINE_EFFECTIVE_LIBVIRTUALDISPLAY_PREBUILT_DIR}"
+                "SUNSHINE_VDD_PACKAGE_DIR=${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_SOURCE_DIR}"
+                "PSModulePath=$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/Modules"
+                powershell -NoLogo -NonInteractive -NoProfile -ExecutionPolicy Bypass
+                -Command
+                "Import-Module Microsoft.PowerShell.Utility; Import-Module Microsoft.PowerShell.Security; & \$env:SUNSHINE_VDD_REFRESH_SCRIPT -ValidateOnly -LibVirtualDisplayDir \$env:SUNSHINE_VDD_LIBVIRTUALDISPLAY_DIR -PrebuiltPackageDir \$env:SUNSHINE_VDD_PREBUILT_DIR -PackageDir \$env:SUNSHINE_VDD_PACKAGE_DIR"
         DEPENDS "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_REFRESH_SCRIPT}"
                 ${SUNSHINE_VIRTUAL_DISPLAY_PACKAGE_FILES}
         COMMENT "Validating Vibepollo Display Driver package assets"
@@ -195,12 +204,15 @@ if(EXISTS "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_REFRESH_SCRIPT}")
     endif()
 
     add_custom_target(refresh_sunshine_virtual_display_driver_assets
-        COMMAND powershell -NoLogo -NonInteractive -NoProfile -ExecutionPolicy Bypass
-                -File "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_REFRESH_SCRIPT}"
-                -Build
-                -LibVirtualDisplayDir "${SUNSHINE_LIBVIRTUALDISPLAY_SOURCE_DIR}"
-                -PrebuiltPackageDir "${SUNSHINE_EFFECTIVE_LIBVIRTUALDISPLAY_PREBUILT_DIR}"
-                -PackageDir "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_SOURCE_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E env
+                "SUNSHINE_VDD_REFRESH_SCRIPT=${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_REFRESH_SCRIPT}"
+                "SUNSHINE_VDD_LIBVIRTUALDISPLAY_DIR=${SUNSHINE_LIBVIRTUALDISPLAY_SOURCE_DIR}"
+                "SUNSHINE_VDD_PREBUILT_DIR=${SUNSHINE_EFFECTIVE_LIBVIRTUALDISPLAY_PREBUILT_DIR}"
+                "SUNSHINE_VDD_PACKAGE_DIR=${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_SOURCE_DIR}"
+                "PSModulePath=$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/Modules"
+                powershell -NoLogo -NonInteractive -NoProfile -ExecutionPolicy Bypass
+                -Command
+                "Import-Module Microsoft.PowerShell.Utility; Import-Module Microsoft.PowerShell.Security; & \$env:SUNSHINE_VDD_REFRESH_SCRIPT -Build -LibVirtualDisplayDir \$env:SUNSHINE_VDD_LIBVIRTUALDISPLAY_DIR -PrebuiltPackageDir \$env:SUNSHINE_VDD_PREBUILT_DIR -PackageDir \$env:SUNSHINE_VDD_PACKAGE_DIR"
                 ${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_SIGNING_ARGS}
         DEPENDS "${SUNSHINE_VIRTUAL_DISPLAY_DRIVER_REFRESH_SCRIPT}"
         COMMENT "Refreshing Vibepollo Display Driver package assets from the pinned release"
@@ -335,4 +347,55 @@ set(CPACK_COMPONENT_FIREWALL_GROUP "Scripts")
 # gamepad scripts are bundled under assets and not exposed as a separate component
 
 # include specific packaging (WiX only)
+set(SUNSHINE_AUDIO_POLICY_SECURITY_CA_OUTPUT_DIR
+    "${CMAKE_BINARY_DIR}/wix-ca")
+set(SUNSHINE_AUDIO_POLICY_SECURITY_CA_DLL
+    "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_OUTPUT_DIR}/audio_policy_security_custom_action.dll")
+add_library(sunshine_audio_policy_security_custom_action MODULE
+    "${CMAKE_SOURCE_DIR}/packaging/windows/wix/audio_policy_security_custom_action.cpp")
+set_target_properties(sunshine_audio_policy_security_custom_action PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "audio_policy_security_custom_action"
+    RUNTIME_OUTPUT_DIRECTORY "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_OUTPUT_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_OUTPUT_DIR}")
+foreach(_sunshine_ca_config IN ITEMS Debug Release RelWithDebInfo MinSizeRel)
+    string(TOUPPER "${_sunshine_ca_config}" _sunshine_ca_config_upper)
+    set_target_properties(sunshine_audio_policy_security_custom_action PROPERTIES
+        "RUNTIME_OUTPUT_DIRECTORY_${_sunshine_ca_config_upper}"
+            "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_OUTPUT_DIR}"
+        "LIBRARY_OUTPUT_DIRECTORY_${_sunshine_ca_config_upper}"
+            "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_OUTPUT_DIR}")
+endforeach()
+target_compile_features(sunshine_audio_policy_security_custom_action PRIVATE cxx_std_23)
+target_compile_definitions(sunshine_audio_policy_security_custom_action PRIVATE
+    UNICODE _UNICODE)
+target_compile_options(sunshine_audio_policy_security_custom_action PRIVATE
+    ${SUNSHINE_COMPILE_OPTIONS})
+if(MINGW)
+    target_link_options(sunshine_audio_policy_security_custom_action PRIVATE
+        -static-libgcc -static-libstdc++ -static)
+endif()
+target_link_libraries(sunshine_audio_policy_security_custom_action PRIVATE
+    advapi32 msi ole32 shell32)
+set(SUNSHINE_AUDIO_POLICY_SECURITY_CA_HASH_INCLUDE
+    "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_OUTPUT_DIR}/audio_policy_security_ca_hash.wxi")
+set(SUNSHINE_AUDIO_POLICY_SECURITY_CA_HASH_SCRIPT
+    "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_OUTPUT_DIR}/write_audio_policy_security_ca_hash.cmake")
+file(GENERATE
+    OUTPUT "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_HASH_SCRIPT}"
+    CONTENT
+"file(SHA256 \"$<TARGET_FILE:sunshine_audio_policy_security_custom_action>\" _audio_policy_ca_sha256)
+file(WRITE \"${SUNSHINE_AUDIO_POLICY_SECURITY_CA_HASH_INCLUDE}\" \"<Include>\\n<?define AudioPolicySecurityCASha256 = \\\"\${_audio_policy_ca_sha256}\\\" ?>\\n</Include>\\n\")
+")
+add_custom_command(TARGET sunshine_audio_policy_security_custom_action POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -P "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_HASH_SCRIPT}"
+    BYPRODUCTS "${SUNSHINE_AUDIO_POLICY_SECURITY_CA_HASH_INCLUDE}"
+    VERBATIM)
+
 include(${CMAKE_MODULE_PATH}/packaging/windows_wix.cmake)
+list(APPEND CPACK_WIX_CANDLE_EXTRA_FLAGS
+    "-dAudioPolicySecurityCA=${SUNSHINE_AUDIO_POLICY_SECURITY_CA_DLL}"
+    "-dAudioPolicySecurityCAHashInclude=${SUNSHINE_AUDIO_POLICY_SECURITY_CA_HASH_INCLUDE}")
+if(TARGET package_msi)
+    add_dependencies(package_msi sunshine_audio_policy_security_custom_action)
+endif()

@@ -1173,6 +1173,61 @@ jobs:
             $failures.Add("MSI container is UNSIGNED: $($env:MSI_NAME)")
           }
 
+          # Read the frozen release candidate back out of the signed setup. This binds the
+          # setup resource to the exact signed MSI selected above instead of trusting the
+          # pre-signing packaging workspace. Certificate rollover is intentionally fail-closed:
+          # both signing stages must be rerun with the same current certificate.
+          $readbackDir = Join-Path ([System.IO.Path]::GetTempPath()) ("setup-readback-" + [System.Guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $readbackDir | Out-Null
+          $embeddedMsi = Join-Path $readbackDir $env:MSI_NAME
+          try {
+            $setupAssembly = [System.Reflection.Assembly]::LoadFile($installer)
+            $resourceStream = $setupAssembly.GetManifestResourceStream('Payload.msi')
+            if ($null -eq $resourceStream) {
+              throw 'The signed setup does not contain the Payload.msi resource.'
+            }
+            try {
+              $outputStream = [System.IO.File]::Open(
+                $embeddedMsi,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None)
+              try {
+                $resourceStream.CopyTo($outputStream)
+                $outputStream.Flush()
+              } finally {
+                $outputStream.Dispose()
+              }
+            } finally {
+              $resourceStream.Dispose()
+            }
+
+            $selectedMsiHash = (Get-FileHash -LiteralPath $signedMsi -Algorithm SHA256).Hash
+            $embeddedMsiHash = (Get-FileHash -LiteralPath $embeddedMsi -Algorithm SHA256).Hash
+            if ($embeddedMsiHash -ne $selectedMsiHash) {
+              $failures.Add('embedded MSI digest differs from the signed MSI selected for this release')
+            } else {
+              Write-Host "[verify] OK   embedded MSI digest matches selected signed MSI: $embeddedMsiHash"
+            }
+
+            if (-not (Test-Signed $embeddedMsi)) {
+              $failures.Add('embedded MSI signature is missing or invalid')
+            }
+            $outerSigner = (Get-AuthenticodeSignature -LiteralPath $installer).SignerCertificate
+            $selectedSigner = (Get-AuthenticodeSignature -LiteralPath $signedMsi).SignerCertificate
+            $embeddedSigner = (Get-AuthenticodeSignature -LiteralPath $embeddedMsi).SignerCertificate
+            if ($null -eq $outerSigner -or $null -eq $selectedSigner -or $null -eq $embeddedSigner) {
+              $failures.Add('release signer certificate metadata is incomplete')
+            } elseif ($outerSigner.Thumbprint -ne $embeddedSigner.Thumbprint -or
+                      $selectedSigner.Thumbprint -ne $embeddedSigner.Thumbprint) {
+              $failures.Add('outer setup and embedded MSI signer thumbprints differ')
+            } else {
+              Write-Host "[verify] OK   setup and MSI signer thumbprint: $($embeddedSigner.Thumbprint)"
+            }
+          } finally {
+            Remove-Item -LiteralPath $readbackDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
           $extractDir = Join-Path ([System.IO.Path]::GetTempPath()) ("msi-verify-" + [System.Guid]::NewGuid().ToString('N'))
           New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
           $log = Join-Path $extractDir 'admin-extract.log'

@@ -343,7 +343,7 @@ TEST(AtmosCapabilityProbeApp, RejectsEverySelfConsistentMutatedGreenPrerequisite
     void (*mutate)(ordered_json &);
     std::string_view expected_error;
   };
-  const std::array<mutation_case, 16> mutations {
+  const std::array<mutation_case, 17> mutations {
     mutation_case {
       .name = "requested endpoint ID",
       .mutate = [](ordered_json &report) {
@@ -442,6 +442,14 @@ TEST(AtmosCapabilityProbeApp, RejectsEverySelfConsistentMutatedGreenPrerequisite
         report["spatial_audio"]["returned_render_device_id"] = "different-winrt-id";
       },
       .expected_error = "a green report requires an exact linked spatial DeviceId",
+    },
+    mutation_case {
+      .name = "self-consistent spatial DeviceId namespace collapse",
+      .mutate = [](ordered_json &report) {
+        report["spatial_audio"]["input_render_device_id"] = k_exact_endpoint_id;
+        report["spatial_audio"]["returned_render_device_id"] = k_exact_endpoint_id;
+      },
+      .expected_error = "a green report requires WinRT DeviceIds distinct from selected_endpoint.id",
     },
     mutation_case {
       .name = "self-consistent missing ready-profile membership",

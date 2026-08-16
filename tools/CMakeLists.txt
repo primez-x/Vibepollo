@@ -37,6 +37,19 @@ target_link_libraries(audio-info
 )
 target_compile_options(audio-info PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
+# One-shot COM boundary for default render endpoint policy. This executable
+# is deliberately separate from the Sunshine service and is installed under
+# the tools directory next to the service binary.
+add_executable(sunshine_audio_policy_helper
+        audio_policy_helper.cpp
+        ${CMAKE_SOURCE_DIR}/src/platform/windows/audio_policy_helper_protocol.cpp)
+set_target_properties(sunshine_audio_policy_helper PROPERTIES CXX_STANDARD 23)
+target_link_libraries(sunshine_audio_policy_helper
+        ole32
+        mmdevapi
+        ${PLATFORM_LIBRARIES})
+target_compile_options(sunshine_audio_policy_helper PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
 add_executable(atmos-capability-probe
         atmos_capability_probe.cpp
         atmos_capability_probe_app.cpp
@@ -51,6 +64,107 @@ target_link_libraries(atmos-capability-probe
         ${PLATFORM_LIBRARIES}
 )
 target_compile_options(atmos-capability-probe PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+add_executable(atmos-spatial-lock-test
+        atmos_spatial_lock_test.cpp
+        atmos_spatial_lock_test_windows.cpp)
+target_link_libraries(atmos-spatial-lock-test
+        nlohmann_json::nlohmann_json
+        ole32
+        windowsapp
+        ksuser
+        mmdevapi
+        ${PLATFORM_LIBRARIES}
+)
+target_compile_options(atmos-spatial-lock-test PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+# Opaque Dolby MAT direct-relay building blocks.  These deliberately remain
+# separate from the legacy Opus path: the host module consumes the driver's
+# fixed record ABI and the client module writes the unchanged carrier through
+# exclusive WASAPI.
+add_library(atmos_mat_direct_protocol STATIC
+        atmos_mat_direct_protocol.cpp)
+target_compile_options(atmos_mat_direct_protocol PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+add_library(atmos_mat_host_relay STATIC
+        atmos_mat_host_relay.cpp
+        atmos_mat_host_relay_windows.cpp)
+target_link_libraries(atmos_mat_host_relay
+        PUBLIC atmos_mat_direct_protocol
+        PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+target_compile_options(atmos_mat_host_relay PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+add_library(atmos_mat_client_writer STATIC
+        atmos_mat_client_writer.cpp
+        atmos_mat_client_writer_windows.cpp
+        atmos_capability_probe_policy.cpp
+        atmos_capability_probe_windows.cpp)
+target_link_libraries(atmos_mat_client_writer
+        PRIVATE ole32 windowsapp ksuser mmdevapi ${PLATFORM_LIBRARIES})
+target_compile_options(atmos_mat_client_writer PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+add_library(atmos_mat_direct_relay_cli STATIC atmos_mat_direct_relay_cli.cpp)
+target_link_libraries(atmos_mat_direct_relay_cli
+        PUBLIC atmos_mat_host_relay atmos_mat_client_writer
+        PRIVATE OpenSSL::SSL OpenSSL::Crypto ws2_32)
+target_compile_options(atmos_mat_direct_relay_cli PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+add_executable(atmos_mat_direct_relay_host atmos_mat_direct_relay_host_main.cpp)
+target_link_libraries(atmos_mat_direct_relay_host PRIVATE atmos_mat_direct_relay_cli)
+target_compile_options(atmos_mat_direct_relay_host PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+add_executable(atmos_mat_direct_relay_client atmos_mat_direct_relay_client_main.cpp)
+target_link_libraries(atmos_mat_direct_relay_client PRIVATE atmos_mat_direct_relay_cli)
+target_compile_options(atmos_mat_direct_relay_client PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+
+# Native, fixed-path one-shot deployer for the two-file audio hotfix. Keep it
+# independent of the Sunshine runtime so recovery does not depend on the files
+# that it is replacing.
+add_executable(vibepollo_audio_hotfix_deployer
+        vibepollo_audio_hotfix_deployer.cpp
+        vibepollo_audio_hotfix_deployer_core.cpp)
+set_target_properties(vibepollo_audio_hotfix_deployer PROPERTIES
+        CXX_STANDARD 23
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+target_link_libraries(vibepollo_audio_hotfix_deployer
+        advapi32
+        iphlpapi
+        ws2_32)
+target_compile_options(vibepollo_audio_hotfix_deployer PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+if(MINGW)
+    target_link_options(vibepollo_audio_hotfix_deployer PRIVATE
+            -municode
+            -static
+            -static-libgcc
+            -static-libstdc++)
+endif()
+add_custom_command(TARGET vibepollo_audio_hotfix_deployer POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/wix_payload/tools"
+        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:vibepollo_audio_hotfix_deployer>" "${CMAKE_BINARY_DIR}/wix_payload/tools/vibepollo_audio_hotfix_deployer.exe")
+
+if(BUILD_TESTS)
+    add_executable(vibepollo_audio_hotfix_deployer_test_cli EXCLUDE_FROM_ALL
+            vibepollo_audio_hotfix_deployer.cpp
+            vibepollo_audio_hotfix_deployer_core.cpp)
+    set_target_properties(vibepollo_audio_hotfix_deployer_test_cli PROPERTIES
+            CXX_STANDARD 23
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_definitions(vibepollo_audio_hotfix_deployer_test_cli PRIVATE
+            VIBEPOLLO_AUDIO_HOTFIX_DEPLOYER_TESTING=1)
+    target_link_libraries(vibepollo_audio_hotfix_deployer_test_cli
+            advapi32
+            iphlpapi
+            ws2_32)
+    target_compile_options(vibepollo_audio_hotfix_deployer_test_cli PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+    if(MINGW)
+        target_link_options(vibepollo_audio_hotfix_deployer_test_cli PRIVATE
+                -municode
+                -static
+                -static-libgcc
+                -static-libstdc++)
+    endif()
+endif()
 
 add_executable(sunshinesvc sunshinesvc.cpp)
 target_link_libraries(sunshinesvc

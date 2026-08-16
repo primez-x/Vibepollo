@@ -1,15 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<?include $(var.AudioPolicySecurityCAHashInclude)?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <!--
     Custom actions to implement the Windows installer behavior:
-    - Reset ACLs on install dir
+    - Transactionally validate and harden the install tree
     - Update PATH (add/remove)
     - Migrate config files
     - Add/remove firewall rules
     - Install/update SudoVDA virtual display driver
     - Install/uninstall service and autostart configuration
     - Optional prompts on uninstall for SudoVDA removal and factory reset of known Vibepollo app data
-    - Detect legacy Sunshine on direct MSI installs and prompt for removal
+    - Detect legacy Sunshine on direct MSI installs and block for manual removal
 
     Notes:
     - Relies on WixUtilExtension (WixQuietExec) to run commands quietly with logging.
@@ -25,10 +26,10 @@
     <!-- VBScript to show a final repair-complete notification (full UI only) -->
     <Binary Id="RepairCompleteVbs" SourceFile="$(sys.SOURCEFILEDIR)repair_complete.vbs"/>
 
-    <!-- VBScripts for legacy Sunshine handling -->
-    <Binary Id="AskUninstallLegacySunshineVbs" SourceFile="$(sys.SOURCEFILEDIR)ask_uninstall_legacy_sunshine.vbs"/>
-    <Binary Id="WaitForLegacyUninstallVbs" SourceFile="$(sys.SOURCEFILEDIR)wait_for_legacy_uninstall.vbs"/>
-    <Binary Id="RemoveConflictingProductsVbs" SourceFile="$(sys.SOURCEFILEDIR)remove_conflicting_products.vbs"/>
+    <Binary Id="AudioPolicyInstallTreeSecurityCA" SourceFile="$(var.AudioPolicySecurityCA)"/>
+    <Property Id="AudioPolicySecurityCABinarySha256"
+              Value="$(var.AudioPolicySecurityCASha256)"
+              Hidden="yes"/>
 
   </Fragment>
 
@@ -121,15 +122,14 @@
   </Fragment>
 
   <Fragment>
-    <!-- Post-install chores (ACL reset, config migration, installer migrations) run
-         AFTER InstallFiles. They are best-effort housekeeping, not prerequisites for
+    <!-- Post-install chores (config migration and installer migrations) run
+         AFTER the native install-tree security prerequisite. They are best-effort, not prerequisites for
          the app to boot: a failure here must NOT roll back / brick an otherwise complete
          upgrade. Use Return="ignore" like the driver/Vulkan-layer actions below; Vibepollo
          re-repairs config ACLs AND re-hardens the private credentials directory at startup
          (statefile::repair_config_permissions / secure_private_directory, and create_creds
          hardens it before writing the key), and the legacy config-key migrations are
          idempotent on the next successful install. -->
-    <CustomAction Id="ResetAcls" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="no" />
     <CustomAction Id="MigrateConfig" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="no" />
     <CustomAction Id="RunInstallerMigrations" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="no" />
     <!-- Driver and Vulkan-layer installs stay Return="ignore" in Vibepollo: a failed
@@ -145,12 +145,11 @@
 
     <!-- Uninstall-time actions (deferred, elevated) -->
     <CustomAction Id="RestoreNvPrefsUndo" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="no" />
-    <CustomAction Id="RemoveConflictingProducts" BinaryKey="RemoveConflictingProductsVbs" VBScriptCall="RemoveConflictingProducts" Execute="immediate" Return="check" />
     <!-- Quiet stop for repair/basic UI: proactively stop service when UI is too low for prompts -->
     <CustomAction Id="StopSvcQuietImmediate" BinaryKey="WixCA" DllEntry="CAQuietExec" Return="ignore" />
     <CustomAction Id="StopSvcQuiet" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="no" />
     <!-- Quiet start after repair for non-full UI; run at commit to avoid FilesInUse/reboot prompts -->
-    <CustomAction Id="StartSvcQuiet" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="commit" Return="ignore" Impersonate="no" />
+    <CustomAction Id="StartSvcQuiet" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="commit" Return="check" Impersonate="no" />
     <!-- Quiet process kill and service removal for manual uninstalls -->
     <CustomAction Id="KillProcsQuietImmediate" BinaryKey="WixCA" DllEntry="CAQuietExec" Return="ignore" />
     <CustomAction Id="KillProcsQuiet" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="no" />
@@ -161,11 +160,52 @@
     <CustomAction Id="FactoryResetAppData" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="no" />
     <CustomAction Id="CleanupEmptyInstallRoot" BinaryKey="WixCA" DllEntry="WixQuietExec" Execute="deferred" Return="ignore" Impersonate="no" />
 
-    <!-- Immediate property setters to pass commands to deferred QuietExec actions -->
-    <CustomAction Id="SetResetAcls"
-                 Property="ResetAcls"
-                 Value="&quot;[SystemFolder]icacls.exe&quot; &quot;[INSTALL_ROOT].&quot; /reset"/>
+    <!-- Binary-table native trust boundary. Prepare obtains the directory through
+         MSI APIs and writes length-prefixed CustomActionData. Forward actions are
+         deferred LocalSystem; rollback actions restore the write-ahead owner/DACL
+         journal; commit actions remove it. HideTarget keeps CustomActionData out of
+         verbose logs. Separate install/uninstall action IDs allow each boundary to
+         run before that operation's first installed payload. -->
+    <CustomAction Id="PrepareAudioPolicyInstallTreeSecurity"
+                  BinaryKey="AudioPolicyInstallTreeSecurityCA"
+                  DllEntry="PrepareAudioPolicyInstallTreeSecurity"
+                  Execute="immediate"
+                  Return="check" />
+    <CustomAction Id="PrepareAudioPolicyUpgradeSecurity"
+                  BinaryKey="AudioPolicyInstallTreeSecurityCA"
+                  DllEntry="PrepareAudioPolicyUpgradeSecurity"
+                  Execute="immediate"
+                  Return="check" />
+    <CustomAction Id="RollbackAudioPolicyInstallTreeSecurity"
+                  BinaryKey="AudioPolicyInstallTreeSecurityCA"
+                  DllEntry="RollbackAudioPolicyInstallTreeSecurity"
+                  Execute="rollback"
+                  Return="ignore"
+                  Impersonate="no"
+                  HideTarget="yes" />
+    <CustomAction Id="ProtectAudioPolicyInstallTreeSecurity"
+                  BinaryKey="AudioPolicyInstallTreeSecurityCA"
+                  DllEntry="ProtectAudioPolicyInstallTreeSecurity"
+                  Execute="deferred"
+                  Return="check"
+                  Impersonate="no"
+                  HideTarget="yes" />
+    <CustomAction Id="CommitAudioPolicyInstallTreeSecurity"
+                  BinaryKey="AudioPolicyInstallTreeSecurityCA"
+                  DllEntry="CommitAudioPolicyInstallTreeSecurity"
+                  Execute="commit"
+                  Return="ignore"
+                  Impersonate="no"
+                  HideTarget="yes" />
+    <CustomAction Id="VerifyAudioPolicyUninstallTreeSecurity"
+                  BinaryKey="AudioPolicyInstallTreeSecurityCA"
+                  DllEntry="VerifyAudioPolicyUninstallTreeSecurity"
+                  Execute="deferred"
+                  Return="check"
+                  Impersonate="no"
+                  HideTarget="yes" />
 
+    <!-- Immediate property setters to pass commands to deferred QuietExec actions -->
     <CustomAction Id="SetMigrateConfig"
                  Property="MigrateConfig"
                  Value="&quot;[SystemFolder]cmd.exe&quot; /C &quot;&quot;[INSTALL_ROOT]scripts\migrate-config.bat&quot;&quot;"/>
@@ -230,10 +270,10 @@
     <!-- Immediate setters for quiet process kill and service removal on manual uninstall -->
     <CustomAction Id="SetKillProcsQuietImmediate"
                  Property="QtExecCmdLine"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -Command &quot;$n='sunshine','sunshinesvc','sunshine_wgc_capture','sunshine_display_helper','playnite-launcher','playnite_launcher','apollo','apollosvc'; foreach($p in $n){ Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }&quot;"/>
+                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -Command &quot;$n='sunshine','sunshinesvc','sunshine_wgc_capture','sunshine_display_helper','sunshine_audio_policy_helper','playnite-launcher','playnite_launcher','apollo','apollosvc'; foreach($p in $n){ Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }&quot;"/>
     <CustomAction Id="SetKillProcsQuiet"
                  Property="KillProcsQuiet"
-                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -Command &quot;$n='sunshine','sunshinesvc','sunshine_wgc_capture','sunshine_display_helper','playnite-launcher','playnite_launcher','apollo','apollosvc'; foreach($p in $n){ Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }&quot;"/>
+                 Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -Command &quot;$n='sunshine','sunshinesvc','sunshine_wgc_capture','sunshine_display_helper','sunshine_audio_policy_helper','playnite-launcher','playnite_launcher','apollo','apollosvc'; foreach($p in $n){ Get-Process -Name $p -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }&quot;"/>
 
     <CustomAction Id="SetUpdatePathRemove"
                  Property="UpdatePathRemove"
@@ -242,13 +282,6 @@
     <CustomAction Id="SetRemoveServiceQuiet"
                  Property="RemoveServiceQuiet"
                  Value="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoP -EP Bypass -C &quot;sc.exe delete SunshineService | Out-Null; sc.exe delete VibeshineService | Out-Null; sc.exe delete sunshinesvc | Out-Null; sc.exe delete ApolloService | Out-Null; sc.exe delete ApolloSvc | Out-Null&quot;"/>
-
-    <!-- Legacy Sunshine handling actions -->
-    <CustomAction Id="AskUninstallLegacySunshine" BinaryKey="AskUninstallLegacySunshineVbs" VBScriptCall="AskUninstallLegacySunshine" Execute="immediate" Return="check" />
-    <CustomAction Id="WaitForLegacyUninstall" BinaryKey="WaitForLegacyUninstallVbs" VBScriptCall="WaitForLegacyUninstall" Execute="immediate" Return="check" />
-
-    <CustomAction Id="BlockLegacySunshineStillPresent" Error="Legacy Sunshine is still installed. It must be removed before installing Vibepollo; click OK to start the uninstallation." />
-    <CustomAction Id="BlockUserCancelledLegacy" Error="Installation cancelled. Legacy Sunshine must be removed before installing Vibepollo." />
 
     <!-- UI-only prompt at end of a successful Repair to inform no reboot is required -->
     <CustomAction Id="RepairCompletePrompt" BinaryKey="RepairCompleteVbs" VBScriptCall="ShowRepairComplete" Execute="immediate" Return="ignore" />

@@ -151,6 +151,7 @@ namespace webrtc_stream {
       std::shared_ptr<std::atomic_uint32_t> inflight;
     };
 
+    [[maybe_unused]]
     void release_shared_encoded_payload(void *user) noexcept {
       auto *context = static_cast<SharedEncodedPayloadReleaseContext *>(user);
       if (!context) {
@@ -821,6 +822,7 @@ namespace webrtc_stream {
       }
     }
 
+    [[maybe_unused]]
     bool starts_with_annexb(const std::vector<std::uint8_t> &data) {
       if (data.size() < 3) {
         return false;
@@ -831,6 +833,7 @@ namespace webrtc_stream {
       return data.size() >= 4 && data[0] == 0 && data[1] == 0 && data[2] == 0 && data[3] == 1;
     }
 
+    [[maybe_unused]]
     std::string hex_prefix(const std::vector<std::uint8_t> &data, std::size_t max_bytes = 8) {
       std::ostringstream oss;
       const std::size_t count = std::min(data.size(), max_bytes);
@@ -1068,6 +1071,7 @@ namespace webrtc_stream {
       return input_context;
     }
 
+    [[maybe_unused]]
     void reset_input_context() {
       std::lock_guard lg {input_mutex};
       if (input_context) {
@@ -1485,6 +1489,7 @@ namespace webrtc_stream {
     void request_webrtc_latency_resync(std::string_view session_id);
 #endif
 
+    [[maybe_unused]]
     void handle_input_message(std::string_view payload, std::string_view session_id = {}) {
       if (payload.empty()) {
         return;
@@ -1935,6 +1940,7 @@ namespace webrtc_stream {
     }
 #endif
 
+    [[maybe_unused]]
     std::optional<std::string> build_gamepad_feedback_payload(const platf::gamepad_feedback_msg_t &msg) {
       nlohmann::json payload;
       payload["type"] = "gamepad_feedback";
@@ -2174,6 +2180,7 @@ namespace webrtc_stream {
       std::optional<Av1FmtpParams> fmtp;
     };
 
+    [[maybe_unused]]
     Av1OfferInfo parse_av1_offer(std::string_view sdp) {
       std::unordered_map<int, Av1FmtpParams> fmtp_params;
       std::vector<int> av1_payloads;
@@ -2274,6 +2281,7 @@ namespace webrtc_stream {
       std::vector<std::string> fmtp_candidates;
     };
 
+    [[maybe_unused]]
     HevcOfferInfo parse_hevc_offer(std::string_view sdp) {
       std::unordered_map<int, std::string> fmtp_params;
       std::vector<int> h265_payloads;
@@ -2339,6 +2347,7 @@ namespace webrtc_stream {
       return info;
     }
 
+    [[maybe_unused]]
     bool hevc_offer_supports_main10(std::string_view fmtp) {
       std::optional<unsigned int> profile_id;
       std::optional<unsigned int> profile_space;
@@ -2393,6 +2402,7 @@ namespace webrtc_stream {
      * @param channels Number of audio channels (2 for stereo, 6 for 5.1, 8 for 7.1)
      * @return Modified SDP string
      */
+    [[maybe_unused]]
     std::string apply_opus_audio_params(std::string_view sdp, int channels) {
       // Determine bitrate based on channel count (matching audio.cpp stream_configs)
       // Using HIGH_QUALITY bitrates since WebRTC config sets HIGH_QUALITY = true

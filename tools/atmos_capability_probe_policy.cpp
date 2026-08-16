@@ -137,6 +137,10 @@ namespace atmos_probe {
              selected_endpoint,
              final_default_endpoints) &&
            !initial_default_render_id.empty() &&
+           initial_default_render_id != selected_endpoint->id &&
+           initial_communications_render_id != selected_endpoint->id &&
+           final_default_render_id != selected_endpoint->id &&
+           final_communications_render_id != selected_endpoint->id &&
            initial_default_render_id == initial_communications_render_id &&
            initial_default_render_id == final_default_render_id &&
            initial_default_render_id == final_communications_render_id;
@@ -172,7 +176,10 @@ namespace atmos_probe {
       observation.spatial.selected_endpoint_linked &&
       observation.spatial.link_source == winrt_default_link_source &&
       !observation.spatial.input_render_device_id.empty();
-    if (!spatial_endpoint_linked) {
+    const auto spatial_device_id_collides_with_selected_endpoint =
+      observation.spatial.input_render_device_id == endpoint.id ||
+      observation.spatial.returned_render_device_id == endpoint.id;
+    if (!spatial_endpoint_linked || spatial_device_id_collides_with_selected_endpoint) {
       result.diagnostics.push_back(diagnostic::spatial_device_id_unlinked);
     } else if (!observation.spatial.configuration_available) {
       result.diagnostics.push_back(diagnostic::spatial_configuration_unavailable);
