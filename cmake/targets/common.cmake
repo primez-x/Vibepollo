@@ -16,6 +16,7 @@ add_dependencies(sunshine web_ui)
 # platform specific target definitions
 if(WIN32)
     include(${CMAKE_MODULE_PATH}/targets/windows.cmake)
+    target_link_libraries(sunshine atmos_mat_host_relay)
 elseif(UNIX)
     include(${CMAKE_MODULE_PATH}/targets/unix.cmake)
 

@@ -16,6 +16,7 @@
 #include "logging.h"
 #include "platform/common.h"
 #include "thread_safe.h"
+#include "tools/atmos_mat_host_relay.h"
 #include "utility.h"
 #include "webrtc_stream.h"
 
@@ -27,6 +28,7 @@ namespace audio {
   static int start_audio_control(audio_ctx_t &ctx);
   static void stop_audio_control(audio_ctx_t &);
   static void apply_surround_params(opus_stream_config_t &stream, const stream_params_t &params);
+  static void capture_mat10(safe::mail_t mail, const config_t &config, void *channel_data);
 
   int map_stream(int channels, bool quality);
 
@@ -134,10 +136,82 @@ namespace audio {
     }
   }
 
+  void capture_mat10(safe::mail_t mail, const config_t &config, void *channel_data) {
+#ifdef _WIN32
+    if (channel_data == nullptr) {
+      BOOST_LOG(error) << "MAT10 cannot be routed through the WebRTC audio path"sv;
+      return;
+    }
+
+    atmos_mat_host::descriptor_identity descriptor {};
+    descriptor.bytes = config.mat10_descriptor;
+    atmos_mat_host::relay relay {descriptor, 30};
+    auto device = atmos_mat_host::make_windows_control_device_reader(nullptr, descriptor);
+    if (!device) {
+      BOOST_LOG(error) << "MAT10 control device is unavailable; refusing opaque audio"sv;
+      return;
+    }
+
+    auto packets = mail::man->queue<packet_t>(mail::audio_packets);
+    atmos_mat_host::reader reader {relay, *device};
+    auto shutdown_event = mail->event<bool>(mail::shutdown);
+    std::uint32_t record_sequence {};
+    while (!shutdown_event->peek()) {
+      const auto terminal = reader.pump_once();
+      if (terminal != atmos_mat_host::terminal_reason::none) {
+        BOOST_LOG(error) << "MAT10 relay stopped with terminal reason "sv << static_cast<int>(terminal);
+        packets->stop();
+        return;
+      }
+
+      while (auto block = relay.pop()) {
+        atmos_mat_direct::record record {
+          block->generation,
+          block->stream_id,
+          block->first_carrier_frame,
+          block->host_qpc,
+          block->host_qpc_frequency,
+          block->descriptor,
+          block->flags,
+          std::move(block->bytes),
+        };
+        const auto wire = atmos_mat_direct::encode(record);
+        if (!wire) {
+          BOOST_LOG(error) << "MAT10 relay produced a malformed record"sv;
+          packets->stop();
+          return;
+        }
+        const auto fragments = mat10_fragment_record(record_sequence++, *wire);
+        if (fragments.empty()) {
+          BOOST_LOG(error) << "MAT10 record exceeded fixed RTP fragment bounds"sv;
+          packets->stop();
+          return;
+        }
+        for (const auto &fragment : fragments) {
+          buffer_t packet {fragment.size()};
+          std::copy(fragment.begin(), fragment.end(), std::begin(packet));
+          packet.fake_resize(fragment.size());
+          packets->raise(channel_data, std::move(packet));
+        }
+      }
+    }
+    reader.cancel();
+#else
+    (void) mail;
+    (void) config;
+    (void) channel_data;
+    BOOST_LOG(error) << "MAT10 transport is only implemented on Windows"sv;
+#endif
+  }
+
   void capture(safe::mail_t mail, config_t config, void *channel_data) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
     if (!config::audio.stream || config.input_only) {
       shutdown_event->view();
+      return;
+    }
+    if (config.transport == transport_e::mat10) {
+      capture_mat10(mail, config, channel_data);
       return;
     }
     auto stream = stream_configs[map_stream(config.channels, config.flags[config_t::HIGH_QUALITY])];

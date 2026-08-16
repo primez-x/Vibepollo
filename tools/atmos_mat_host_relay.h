@@ -14,6 +14,8 @@ typedef struct ssl_ctx_st SSL_CTX;
 namespace atmos_mat_host {
   constexpr std::size_t carrier_frame_bytes = atmos_mat_direct::carrier_frame_bytes;
   using descriptor_identity = atmos_mat_direct::descriptor;
+  struct tap_session_identity { std::uint64_t driver_generation {}, stream_id {}; };
+  [[nodiscard]] std::optional<tap_session_identity> validate_tap_session(std::uint64_t driver_generation, std::uint64_t stream_id);
   struct carrier_block { std::uint64_t generation {}, stream_id {}, first_carrier_frame {}, host_qpc {}, host_qpc_frequency {}; descriptor_identity descriptor {}; std::uint32_t flags {}; std::vector<std::uint8_t> bytes; };
   enum class admit_result { accepted, gap_poisoned, generation_changed_poisoned, stream_changed_poisoned, descriptor_mismatch_poisoned, queue_full_poisoned, malformed_poisoned };
   enum class terminal_reason { none, malformed, gap, generation_change, stream_change, descriptor_mismatch, queue_full, cancelled, eof, transport_error };

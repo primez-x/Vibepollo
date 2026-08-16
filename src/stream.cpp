@@ -604,6 +604,7 @@ namespace stream {
       util::buffer_t<uint8_t *> shards_p;
 
       audio_fec_packet_t fec_packet;
+      audio::mat10_fragment_sequence_policy_t mat10_policy;
       std::unique_ptr<platf::deinit_t> qos;
     } audio;
 
@@ -2320,6 +2321,16 @@ namespace stream {
         continue;
       }
 
+      const auto mat10 = session->config.audio.transport == audio::transport_e::mat10;
+      const auto mat10_fragment = mat10 ?
+        audio::parse_mat10_fragment(std::span<const std::uint8_t> {packet_data.begin(), packet_data.size()}) :
+        std::optional<audio::mat10_fragment_view_t> {};
+      if (mat10 && (packet_data.size() != audio::mat10_fragment_bytes || !mat10_fragment ||
+                    !session->audio.mat10_policy.admit(*mat10_fragment))) {
+        BOOST_LOG(error) << "Refusing malformed MAT10 audio fragment"sv;
+        break;
+      }
+
       auto sequenceNumber = session->audio.sequenceNumber;
       auto timestamp = session->audio.timestamp;
 
@@ -2337,6 +2348,7 @@ namespace stream {
 
       audio_packet.rtp.sequenceNumber = util::endian::big(sequenceNumber);
       audio_packet.rtp.timestamp = util::endian::big(timestamp);
+      audio_packet.rtp.packetType = mat10 ? audio::mat10_rtp_payload_type : 97;
 
       session->audio.sequenceNumber++;
       session->audio.timestamp += session->config.audio.packetDuration;
@@ -3331,7 +3343,8 @@ namespace stream {
         session->audio.fec_packet.rtp.packetType = 127;
         session->audio.fec_packet.rtp.timestamp = 0;
         session->audio.fec_packet.rtp.ssrc = 0;
-        session->audio.fec_packet.fecHeader.payloadType = 97;
+        session->audio.fec_packet.fecHeader.payloadType = config.audio.transport == audio::transport_e::mat10 ?
+                                                        audio::mat10_rtp_payload_type : 97;
         session->audio.fec_packet.fecHeader.ssrc = 0;
         session->audio.cipher = crypto::cipher::cbc_t {launch_session.gcm_key, true};
         session->audio.ping_payload = launch_session.av_ping_payload;

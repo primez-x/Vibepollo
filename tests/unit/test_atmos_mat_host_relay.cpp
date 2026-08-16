@@ -37,3 +37,13 @@ TEST(AtmosMatHostRelay, PoisonsGapsAndCapacityAndDistinguishesCleanEof) {
   read.cancel();
   EXPECT_TRUE(device.cancelled());
 }
+
+TEST(AtmosMatHostRelay, RequiresActiveDriverGenerationAndStreamBeforeRead) {
+  using namespace atmos_mat_host;
+  EXPECT_FALSE(validate_tap_session(0, 7));
+  EXPECT_FALSE(validate_tap_session(9, 0));
+  const auto session = validate_tap_session(9, 7);
+  ASSERT_TRUE(session);
+  EXPECT_EQ(session->driver_generation, 9u);
+  EXPECT_EQ(session->stream_id, 7u);
+}

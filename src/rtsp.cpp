@@ -181,6 +181,24 @@ namespace rtsp_stream {
     return config.dynamicRange != 0 && !config.prefer_sdr_10bit && !config.force_sdr;
   }
 
+  [[nodiscard]] bool decode_mat10_descriptor(
+    const std::string_view encoded,
+    std::array<std::uint8_t, 52> &descriptor) {
+    if (encoded.size() != descriptor.size() * 2) return false;
+    const auto nibble = [](const char value) -> std::optional<std::uint8_t> {
+      if (value >= '0' && value <= '9') return static_cast<std::uint8_t>(value - '0');
+      if (value >= 'a' && value <= 'f') return static_cast<std::uint8_t>(value - 'a' + 10);
+      return std::nullopt;
+    };
+    for (std::size_t index = 0; index != descriptor.size(); ++index) {
+      const auto high = nibble(encoded[index * 2]);
+      const auto low = nibble(encoded[index * 2 + 1]);
+      if (!high || !low) return false;
+      descriptor[index] = static_cast<std::uint8_t>((*high << 4) | *low);
+    }
+    return true;
+  }
+
   std::shared_ptr<launch_session_t> make_startup_launch_session_snapshot(const launch_session_t &source) {
     auto snapshot = std::make_shared<launch_session_t>();
 
@@ -1918,6 +1936,21 @@ namespace rtsp_stream {
         }
       }
       config.audio.flags[audio::config_t::CUSTOM_SURROUND_PARAMS] = valid;
+    }
+
+    // This extension is opt-in and versioned. Its absence preserves every
+    // legacy Moonlight/Apollo audio negotiation path unchanged.
+    if (const auto codec = args.find("x-vibepollo-audio.codec"sv); codec != args.end()) {
+      const auto version = args.find("x-vibepollo-audio.protocolVersion"sv);
+      const auto descriptor = args.find("x-vibepollo-audio.matDescriptor"sv);
+      if (codec->second != "mat10"sv || version == args.end() || version->second != "1"sv ||
+          descriptor == args.end() || !decode_mat10_descriptor(descriptor->second, config.audio.mat10_descriptor)) {
+        BOOST_LOG(warning) << "Rejecting malformed Vibepollo MAT10 audio negotiation"sv;
+        respond(socket->sock, *session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+        return false;
+      }
+      config.audio.transport = audio::transport_e::mat10;
+      BOOST_LOG(info) << "Client negotiated MAT10 audio transport"sv;
     }
     if (session->continuous_audio) {
       BOOST_LOG(info) << "Client requested continuous audio"sv;

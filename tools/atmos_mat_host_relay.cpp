@@ -9,6 +9,10 @@
 
 namespace atmos_mat_host {
   namespace { void digest(std::array<std::uint8_t,32> &out, std::span<const std::uint8_t> old, std::span<const std::uint8_t> next) { EVP_MD_CTX *ctx=EVP_MD_CTX_new(); if (!ctx) return; unsigned int n {}; EVP_DigestInit_ex(ctx,EVP_sha256(),nullptr); EVP_DigestUpdate(ctx,old.data(),old.size()); EVP_DigestUpdate(ctx,next.data(),next.size()); EVP_DigestFinal_ex(ctx,out.data(),&n); EVP_MD_CTX_free(ctx); } }
+  std::optional<tap_session_identity> validate_tap_session(std::uint64_t driver_generation, std::uint64_t stream_id) {
+    if (!driver_generation || !stream_id) return std::nullopt;
+    return tap_session_identity {driver_generation, stream_id};
+  }
   relay::relay(descriptor_identity expected, std::size_t capacity) : expected_(expected), capacity_(capacity) {}
   admit_result relay::admit(const carrier_block &b) {
     const auto fail=[this](terminal_reason r, admit_result a){ poisoned_=true; terminal_=r; queue_.clear(); return a; };

@@ -27,6 +27,7 @@ namespace atmos_mat_host {
     constexpr DWORD ioctl_vibe_mat_tap_status = 0x00226004UL;
     constexpr DWORD ioctl_vibe_mat_tap_read = 0x0022600aUL;
     constexpr wchar_t default_device_path[] = L"\\\\.\\VibepolloMatTap";
+    struct ioctl_result { bool ok {}; DWORD error {ERROR_GEN_FAILURE}; DWORD bytes {}; };
     std::uint16_t u16(const std::vector<std::uint8_t> &v, std::size_t o) { return v[o] | (std::uint16_t(v[o+1]) << 8); }
     std::uint32_t u32(const std::vector<std::uint8_t> &v, std::size_t o) { std::uint32_t x {}; for (int i=3;i>=0;--i) x=(x<<8)|v[o+i]; return x; }
     std::uint64_t u64(const std::vector<std::uint8_t> &v, std::size_t o) { std::uint64_t x {}; for (int i=7;i>=0;--i) x=(x<<8)|v[o+i]; return x; }
@@ -42,19 +43,51 @@ namespace atmos_mat_host {
       ~windows_control_device_reader() override { cancel(); if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_); }
       std::optional<std::vector<std::uint8_t>> read() override {
         while (handle_ != INVALID_HANDLE_VALUE && !cancelled_.load()) {
+          if (!session_ && !refresh_session()) return std::nullopt;
           std::vector<std::uint8_t> buffer(atmos_mat_direct::header_bytes + atmos_mat_direct::max_payload_bytes);
-          OVERLAPPED pending {}; pending.hEvent=CreateEventW(nullptr, TRUE, FALSE, nullptr); if(!pending.hEvent) return std::nullopt;
-          const tap_request request {0x3154414dU, 1, 0, sizeof(tap_request), 0, sizeof(tap_request), 0, 0, 0};
-          DWORD bytes {}; const BOOL started=DeviceIoControl(handle_, ioctl_vibe_mat_tap_read, const_cast<tap_request *>(&request), sizeof(request), buffer.data(), static_cast<DWORD>(buffer.size()), &bytes, &pending);
-          if (!started && GetLastError()==ERROR_IO_PENDING) { if(WaitForSingleObject(pending.hEvent,INFINITE)==WAIT_OBJECT_0) GetOverlappedResult(handle_,&pending,&bytes,FALSE); }
-          const auto error = started ? ERROR_SUCCESS : GetLastError(); CloseHandle(pending.hEvent); if (cancelled_.load()) return std::nullopt;
-          if (!started && (error == ERROR_NO_MORE_ITEMS || error == ERROR_NO_MORE_FILES)) { Sleep(1); continue; }
-          if ((!started) && bytes==0) return std::nullopt; buffer.resize(bytes); return frame_driver_record(buffer, expected_);
+          const tap_request request {0x3154414dU, 1, 0, sizeof(tap_request), 0, sizeof(tap_request), session_->driver_generation, session_->stream_id, 0};
+          const auto result = invoke_ioctl(ioctl_vibe_mat_tap_read, request, buffer.data(), static_cast<DWORD>(buffer.size()));
+          if (cancelled_.load()) return std::nullopt;
+          if (!result.ok && (result.error == ERROR_NO_MORE_ITEMS || result.error == ERROR_NO_MORE_FILES)) { Sleep(1); continue; }
+          if (!result.ok && result.error == ERROR_RETRY) { session_.reset(); continue; }
+          if (!result.ok || !result.bytes) return std::nullopt;
+          buffer.resize(result.bytes); return frame_driver_record(buffer, expected_);
         }
         return std::nullopt;
       }
       void cancel() noexcept override { cancelled_.store(true); if(handle_!=INVALID_HANDLE_VALUE) CancelIoEx(handle_,nullptr); }
-    private: descriptor_identity expected_ {}; HANDLE handle_ {INVALID_HANDLE_VALUE}; std::atomic_bool cancelled_ {};
+    private:
+      ioctl_result invoke_ioctl(DWORD code, const tap_request &request, void *output, DWORD output_bytes) {
+        OVERLAPPED pending {};
+        pending.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!pending.hEvent) return {};
+        DWORD bytes {};
+        BOOL completed = DeviceIoControl(handle_, code, const_cast<tap_request *>(&request), sizeof(request), output, output_bytes, &bytes, &pending);
+        DWORD error = completed ? ERROR_SUCCESS : GetLastError();
+        if (!completed && error == ERROR_IO_PENDING) {
+          if (WaitForSingleObject(pending.hEvent, INFINITE) == WAIT_OBJECT_0 && GetOverlappedResult(handle_, &pending, &bytes, FALSE)) {
+            completed = TRUE;
+            error = ERROR_SUCCESS;
+          } else {
+            error = GetLastError();
+          }
+        }
+        CloseHandle(pending.hEvent);
+        return {completed == TRUE, error, bytes};
+      }
+      bool refresh_session() {
+        tap_status status {};
+        const tap_request request {0x3154414dU, 1, 0, sizeof(tap_request), 0, sizeof(tap_request), 0, 0, 0};
+        const auto result = invoke_ioctl(ioctl_vibe_mat_tap_status, request, &status, sizeof(status));
+        if (!result.ok || result.bytes != sizeof(status) || status.magic != 0x3154414dU || status.major != 1 || status.minor > 0 ||
+            status.header_bytes != sizeof(status) || status.reserved0 != 0 || status.total_bytes != sizeof(status) || status.reserved1 != 0) return false;
+        session_ = validate_tap_session(status.driver_generation, status.stream_id);
+        return session_.has_value();
+      }
+      descriptor_identity expected_ {};
+      HANDLE handle_ {INVALID_HANDLE_VALUE};
+      std::atomic_bool cancelled_ {};
+      std::optional<tap_session_identity> session_;
     };
   }
   std::unique_ptr<byte_transport> make_windows_control_device_reader(const wchar_t *path, descriptor_identity expected) { return std::make_unique<windows_control_device_reader>(path, expected); }

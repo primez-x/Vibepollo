@@ -502,6 +502,11 @@ if(WIN32)
             "${SUNSHINE_TEST_REPOSITORY_ROOT}/tools/atmos_mat_client_writer.cpp"
     )
     sunshine_register_component(
+        NAME test_component_atmos_mat_runtime
+        TEST_SOURCE unit/test_atmos_mat_runtime.cpp
+        LINK_LIBRARIES Boost::process ws2_32
+    )
+    sunshine_register_component(
         NAME test_component_atmos_mat_direct_relay_cli
         TEST_SOURCE unit/test_atmos_mat_direct_relay_cli.cpp
         PRODUCT_SOURCES
