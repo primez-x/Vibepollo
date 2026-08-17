@@ -183,9 +183,10 @@ asynchronous launch request is started:
    locally. Resolve the canonical directory and final file path with
    case-insensitive containment, reject UNC/device/alternate-stream,
    absolute, traversal-shaped, missing, unreadable, or reparse-point escapes,
-   and verify the opened handle's final path remains inside the directory.
-   Apply the same 32 MiB/structural checks as the host and parse MHC2. Free
-   the API-owned name with `LocalFree`. Missing exports,
+   then open read-only with `CreateFileW`, verify the handle's
+   `GetFinalPathNameByHandleW` remains inside the directory, and perform one
+   bounded read. Apply the same 32 MiB/structural checks as the host and parse
+   MHC2. Free the API-owned name with `LocalFree`. Missing exports,
    unsupported OS builds, missing profiles, `STANDARD`-only profiles, and
    parse failures produce no calibrated value.
 4. Query the selected DXGI output through
@@ -220,6 +221,15 @@ the asynchronous connection thread begins. The host receives the data before
 virtual-display creation and capture preparation. A later display move is
 outside v1 and leaves the launch snapshot unchanged.
 
+Because the initialization test window is destroyed before `Session::start()`
+starts `AsyncConnectionStartThread`, the client performs one final
+GUI-thread display-identity validation immediately before that handoff,
+retaining or recreating the hidden test window as needed. A changed screen,
+SDL/DXGI binding, or display descriptor clears the snapshot (and may recollect
+from the newly selected display) before `NvHTTP::startApp()`. The remaining
+race after the worker handoff is a documented v1 limitation; no later
+renegotiation is attempted.
+
 ## Vibepollo host integration
 
 The host parses `clientDisplayCapabilities` for both launch verbs before
@@ -229,14 +239,15 @@ computing runtime overrides and stores the validated result on
 become a saved host configuration. `clone_for_startup()` must copy the new
 field explicitly.
 
-Client-derived policy uses the existing authoritative
+Client-derived policy uses one canonical effective-HDR resolver shared by
+session construction and peak policy. Its current result is the existing
 `rtsp_stream::effective_hdr_requested(const launch_session_t&)` predicate,
-which is `enable_hdr && !prefer_sdr_10bit && !force_sdr`. The predicate is
-evaluated after `hdrMode`, per-client 10-bit-SDR preference, and the Windows
-`hdr_request_override` force-on/force-off/automatic setting have been applied
-in the existing launch setup, and before client peak selection in both launch
-and resume. Backend display mode must not substitute a different HDR
-predicate.
+`enable_hdr && !prefer_sdr_10bit && !force_sdr`, after `hdrMode`, per-client
+10-bit-SDR preference, and the Windows `hdr_request_override` force-on/
+force-off/automatic setting have been applied. Launch and resume must resolve
+this seed once before peak selection and pass the same result into the session
+builder and policy; neither may independently reinterpret `hdrMode`. Backend
+display mode must not substitute a different HDR predicate.
 
 The effective HDR target helper consumes both the existing explicit settings
 and the new session capability object. It returns the selected peak, source,
@@ -290,18 +301,26 @@ that target, while application termination performs the existing eventual
 clear. Per-session capability fields may still be retained for logs, but they
 do not retarget global capture/encoder state while another owner is active.
 
-Implement this as a private `hdr_runtime_owner_state` adjacent to the existing
-HTTP lifecycle state, protected by the same route gate. It stores an owner
-token/generation, phase (`provisional`, `awaiting-stream`, `active`, or
-`retained-paused`), the prior runtime-map snapshot, and the resolved target.
-An idle launch/resume begins a transaction and publishes the candidate map;
-the HTTP success response moves it to `awaiting-stream`, first stream-session
-activation commits `active`, and any request, virtual-display, or stream-start
-failure restores both the prior map and owner record. A join copies the active
-owner's target without opening a transaction. Last-stream teardown marks a
-still-running application `retained-paused` without clearing the map; a later
-idle request replaces it transactionally. `proc_t::terminate()` clears the
-runtime map and owner state together.
+Implement this as a private `hdr_runtime_owner_state`/transaction manager
+shared by HTTP, RTSP, WebRTC, stream teardown, and process termination, using
+the existing `stream_lifecycle_gate` as its single mutation lock. A
+generation-checked lease stores the proposed owner token, prior map, prior
+owner, candidate map, and phase (`provisional`, `awaiting-stream`, `active`,
+or `retained-paused`). An idle launch/resume begins a lease and publishes the
+candidate map; HTTP success leaves it awaiting stream ownership rather than
+committing it. First RTSP/WebRTC ownership publication commits the matching
+generation. Synchronous errors, pending-session cancellation/expiry,
+virtual-display failure, and asynchronous stream-start failure roll back the
+matching lease under the gate. A stale rollback cannot overwrite a newer
+generation. A join copies the active owner's target without opening a lease.
+Last-stream teardown marks a still-running application `retained-paused`
+without clearing the map; a later idle request replaces it transactionally.
+`proc_t::terminate()` clears the runtime map and owner state together.
+
+All writes that can change `rtx_hdr_peak_brightness` must use this manager:
+launch/resume, WebRTC's first-capture path, application termination, and live
+RTX HDR edits. An explicit live numeric edit updates owner provenance
+atomically; unrelated runtime keys remain under the existing config API.
 
 ## User interface and documentation
 
@@ -341,8 +360,9 @@ translation/fallback conventions rather than replacing unrelated translations.
 - No client-supplied path is opened by the host.
 - Payload size, numeric ranges, and JSON structure are bounded before use.
 - HTTP verbose request logging redacts the complete
-  `clientDisplayCapabilities` value. Runtime logs identify the selected source
-  and fallback reason without exposing raw profile data.
+  `clientDisplayCapabilities` value before parsing, case-insensitively and for
+  every route, regardless of validity or size. Runtime logs identify the
+  selected source and fallback reason without exposing raw profile data.
 
 ## Testing and verification
 
