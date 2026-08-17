@@ -466,7 +466,8 @@ The initial lifecycle inventory is pinned to `stream.cpp:2705-2808,2993-3005`,
 RTSP callers at `rtsp.cpp:672-677,724-756,819-846,1076-1127,1137-1163,1882`,
 WebRTC callers at `webrtc_stream.cpp:3014,3456-3462,3491,3500,5419,5518,5544,5641`,
 process/runtime writers at `process.cpp:2513-2523,2719,3962-4027,4030-4091`,
-HTTP/runtime writers at `nvhttp.cpp:3217,3300-3340,3786-3795,4168-4170,4913`,
+HTTP/runtime writers and client-override construction at
+`nvhttp.cpp:3217,3300-3340,3786-3795,4168-4170,4709-4722,4913`,
 and external termination callers at `confighttp.cpp:2220,2855,5223,5245`,
 `main.cpp:528`, `system_tray.cpp:107,113,120,530`, and
 `platform/windows/playnite_integration.cpp:947`. Implementation must rerun

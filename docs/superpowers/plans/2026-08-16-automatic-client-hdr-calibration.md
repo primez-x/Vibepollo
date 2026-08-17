@@ -162,7 +162,8 @@
    `src/webrtc_stream.cpp:3014,3456-3462,3491,3500,5419,5518,5544,5641`;
    process termination/runtime writers at
    `src/process.cpp:2513-2523,2719,3962-4027,4030-4091`; HTTP/runtime
-   writers at `src/nvhttp.cpp:3217,3300-3340,3786-3795,4168-4170,4913`;
+   writers and client-override construction at
+   `src/nvhttp.cpp:3217,3300-3340,3786-3795,4168-4170,4709-4722,4913`;
    configuration and external termination callers at
    `src/confighttp.cpp:2220,2855,5223,5245`, `src/main.cpp:528`,
    `src/system_tray.cpp:107,113,120,530`, and
