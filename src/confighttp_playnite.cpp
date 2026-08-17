@@ -37,6 +37,7 @@
   #include "config_playnite.h"
   #include "confighttp.h"
   #include "httpcommon.h"
+  #include "src/http_request_view.h"
   #include "logging.h"
   #include "src/platform/windows/ipc/misc_utils.h"
   #include "src/platform/windows/playnite_integration.h"
@@ -55,7 +56,7 @@ namespace confighttp {
 
   // Bring request/response types into scope to match confighttp.cpp usage
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
-  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
+  using req_https_t = http::client_hdr::request_view;
 
   // Forward declarations for helpers defined in confighttp.cpp
   bool authenticate(resp_https_t response, req_https_t request);
@@ -323,7 +324,7 @@ namespace confighttp {
     bool request_restart = false;
     try {
       std::stringstream ss;
-      ss << request->content.rdbuf();
+      ss << request.body;
       if (ss.rdbuf()->in_avail() > 0) {
         auto in = nlohmann::json::parse(ss);
         request_restart = in.value("restart", false);
@@ -375,7 +376,7 @@ namespace confighttp {
     bool request_restart = false;
     try {
       std::stringstream ss;
-      ss << request->content.rdbuf();
+      ss << request.body;
       if (ss.rdbuf()->in_avail() > 0) {
         auto in = nlohmann::json::parse(ss);
         request_restart = in.value("restart", false);
@@ -426,7 +427,7 @@ namespace confighttp {
 
     try {
       std::stringstream stream;
-      stream << request->content.rdbuf();
+      stream << request.body;
       const auto input = nlohmann::json::parse(stream);
       const auto playnite_id = input.value("playnite_id", "");
       const auto cover_key = input.value("cover_key", "");
@@ -2181,7 +2182,7 @@ namespace confighttp {
     }
     print_req(request);
     try {
-      const std::string body = request->content.string();
+      const std::string body = request.body;
       if (body.empty()) {
         bad_request(response, request, "Missing request body");
         return;
@@ -2256,7 +2257,7 @@ namespace confighttp {
     print_req(request);
     try {
       std::size_t part_index = 1;
-      auto query = request->parse_query_string();
+      auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
       if (const auto it = query.find("part"); it != query.end()) {
         try {
           part_index = static_cast<std::size_t>(std::stoul(it->second));

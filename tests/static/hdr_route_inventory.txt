@@ -1,0 +1,5 @@
+# route source | required request-boundary tokens
+src/nvhttp.cpp|make_request_view|adapt_request
+src/confighttp.cpp|make_request_view|adapt_request|register_api_route
+src/confighttp_rtss.cpp|request_view|parse_sanitized_query
+src/confighttp_playnite.cpp|request_view|parse_sanitized_query

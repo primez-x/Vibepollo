@@ -56,6 +56,7 @@
 #include "file_handler.h"
 #include "globals.h"
 #include "httpcommon.h"
+#include "hdr_runtime_owner.h"
 #include "input.h"
 #include "logging.h"
 #include "nvhttp.h"
@@ -874,6 +875,7 @@ namespace webrtc_stream {
       std::optional<WebRtcCaptureConfigKey> config_key;
       std::optional<WebRtcStreamStartParams> stream_start_params;
       std::optional<int> published_bitrate_kbps;
+      std::optional<hdr_runtime_owner::lease_token_t> runtime_owner_token;
     };
 
     template<class T>
@@ -3085,13 +3087,20 @@ namespace webrtc_stream {
       // capture or limiter policy: global config, then application, then client.
       // An existing capture owns the process-wide runtime config, so additional
       // WebRTC sessions must reuse it rather than mutating the active stream.
-      bool runtime_overrides_applied = false;
       bool keep_runtime_overrides = false;
+      const auto runtime_prior_overrides = hdr_runtime_owner::runtime_overrides_snapshot();
+      std::optional<hdr_runtime_owner::lease_token_t> runtime_owner_token;
       auto runtime_overrides_guard = util::fail_guard([&]() {
-        if (!runtime_overrides_applied || keep_runtime_overrides) {
+        if (!runtime_owner_token || keep_runtime_overrides) {
           return;
         }
-        config::clear_runtime_config_overrides();
+        const auto rollback = hdr_runtime_owner::global_manager().cancel(
+          *runtime_owner_token,
+          hdr_runtime_owner::runtime_overrides_snapshot()
+        );
+        if (rollback.replacement_map) {
+          hdr_runtime_owner::publish_rollback_runtime_overrides(*rollback.replacement_map);
+        }
         if (!rtsp_sessions_active.load(std::memory_order_relaxed) &&
             !webrtc_capture.active.load(std::memory_order_acquire)) {
           config::apply_config_now();
@@ -3101,8 +3110,21 @@ namespace webrtc_stream {
       });
 
       if (!rtsp_active && !capture_already_active) {
-        config::set_runtime_config_overrides(std::move(requested_runtime_overrides));
-        runtime_overrides_applied = true;
+        const auto transaction = hdr_runtime_owner::global_manager().begin_candidate(runtime_prior_overrides);
+        const auto lease = hdr_runtime_owner::global_manager().apply_candidate(
+          transaction,
+          requested_runtime_overrides
+        );
+        if (!lease) {
+          return std::string {"Unable to reserve WebRTC runtime configuration"};
+        }
+        runtime_owner_token = lease->token;
+        if (!hdr_runtime_owner::publish_candidate_runtime_overrides(
+              *runtime_owner_token,
+              requested_runtime_overrides
+            )) {
+          throw std::runtime_error("WebRTC runtime candidate became stale before publication");
+        }
         config::apply_config_now();
       }
 
@@ -3274,40 +3296,114 @@ namespace webrtc_stream {
       }
 
       auto mail = std::make_shared<safe::mail_raw_t>();
+      std::thread pending_video_thread;
+      std::thread pending_audio_thread;
+#ifdef SUNSHINE_ENABLE_WEBRTC
+      std::thread pending_feedback_thread;
+      safe::mail_raw_t::queue_t<platf::gamepad_feedback_msg_t> pending_feedback_queue;
+#endif
+#ifdef _WIN32
+      bool frame_limiter_started = false;
+#endif
+      auto capture_start_guard = util::fail_guard([&]() {
+        // The first-capture transaction owns the worker threads until the
+        // runtime-owner commit succeeds. Signal every worker before joining so
+        // a failed thread construction or stale commit cannot strand a capture
+        // that is not represented by active ownership.
+        try {
+          if (const auto shutdown_event = mail->event<bool>(mail::shutdown)) {
+            shutdown_event->raise(true);
+          }
+        } catch (...) {
+        }
+        webrtc_capture.feedback_shutdown.store(true, std::memory_order_release);
+#ifdef SUNSHINE_ENABLE_WEBRTC
+        if (pending_feedback_queue) {
+          pending_feedback_queue->stop();
+        }
+#endif
+#ifdef SUNSHINE_ENABLE_WEBRTC
+        if (pending_feedback_thread.joinable()) {
+          pending_feedback_thread.join();
+        }
+#endif
+        if (pending_video_thread.joinable()) {
+          pending_video_thread.join();
+        }
+        if (pending_audio_thread.joinable()) {
+          pending_audio_thread.join();
+        }
+#ifdef _WIN32
+        if (frame_limiter_started) {
+          platf::frame_limiter_streaming_stop(platf::frame_limiter_owner::webrtc, false);
+          frame_limiter_started = false;
+        }
+#endif
+        webrtc_capture.feedback_queue.reset();
+        webrtc_capture.mail.reset();
+        webrtc_capture.launch_session.reset();
+        webrtc_capture.app_id.reset();
+        webrtc_capture.config_key.reset();
+        webrtc_capture.stream_start_params.reset();
+        webrtc_capture.published_bitrate_kbps.reset();
+        webrtc_capture.runtime_owner_token.reset();
+        webrtc_capture.active.store(false, std::memory_order_release);
+      });
       webrtc_capture.mail = mail;
       webrtc_capture.launch_session = launch_session;
       webrtc_capture.app_id = effective_app_id > 0 ? std::optional<int> {effective_app_id} : std::nullopt;
       webrtc_capture.config_key = desired_key;
       webrtc_capture.published_bitrate_kbps.reset();
-#ifdef _WIN32
-      if (pending_output_override_lease) {
-        webrtc_capture.output_override_lease = pending_output_override_lease;
-      }
-      output_override_guard.disable();
-#endif
       webrtc_capture.feedback_shutdown.store(false, std::memory_order_release);
 #ifdef SUNSHINE_ENABLE_WEBRTC
-      webrtc_capture.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
-      webrtc_capture.feedback_thread = std::thread([queue = webrtc_capture.feedback_queue]() {
+      pending_feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
+      webrtc_capture.feedback_queue = pending_feedback_queue;
+      pending_feedback_thread = std::thread([queue = pending_feedback_queue]() {
         feedback_thread_main(queue);
       });
 #endif
-      webrtc_capture.active.store(true, std::memory_order_release);
 
-      webrtc_capture.video_thread = std::thread([mail, video_config]() mutable {
+      pending_video_thread = std::thread([mail, video_config]() mutable {
         video::capture(mail, video_config, nullptr);
       });
-      webrtc_capture.audio_thread = std::thread([mail, audio_config]() mutable {
+      pending_audio_thread = std::thread([mail, audio_config]() mutable {
         audio::capture(mail, audio_config, nullptr);
       });
-      keep_runtime_overrides = true;
 #ifdef _WIN32
+      frame_limiter_started = true;
       acquire_webrtc_frame_limiter_locked(*webrtc_capture.stream_start_params);
+#endif
+      if (runtime_owner_token) {
+        const auto commit_status = hdr_runtime_owner::global_manager().commit(*runtime_owner_token);
+        if (commit_status == hdr_runtime_owner::commit_status_e::stale) {
+          throw std::runtime_error("WebRTC runtime candidate became stale before capture activation");
+        }
+      }
+
+      // Nothing below this point performs fallible allocation or ownership
+      // transfer. The threads and runtime lease are now safely owned by the
+      // capture state, and active is published only after the commit.
+#ifdef SUNSHINE_ENABLE_WEBRTC
+      webrtc_capture.feedback_thread = std::move(pending_feedback_thread);
+#endif
+      webrtc_capture.video_thread = std::move(pending_video_thread);
+      webrtc_capture.audio_thread = std::move(pending_audio_thread);
+      webrtc_capture.runtime_owner_token = runtime_owner_token;
+      webrtc_capture.active.store(true, std::memory_order_release);
+#ifdef _WIN32
+      if (pending_output_override_lease) {
+        webrtc_capture.output_override_lease = std::move(pending_output_override_lease);
+      }
 #endif
       stream::session::arm_shared_runtime_cleanup(
         launch_session->virtual_display_guid_bytes
       );
       webrtc_capture.pending_session_creations.fetch_add(1, std::memory_order_release);
+      capture_start_guard.disable();
+#ifdef _WIN32
+      output_override_guard.disable();
+#endif
+      keep_runtime_overrides = true;
       return std::nullopt;
     }
 
@@ -3425,6 +3521,7 @@ namespace webrtc_stream {
         webrtc_capture.config_key.reset();
         webrtc_capture.stream_start_params.reset();
         webrtc_capture.published_bitrate_kbps.reset();
+        webrtc_capture.runtime_owner_token.reset();
 
         const bool rtsp_owns_runtime =
           rtsp_sessions_active.load(std::memory_order_acquire) ||

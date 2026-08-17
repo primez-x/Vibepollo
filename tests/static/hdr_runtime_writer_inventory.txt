@@ -1,0 +1,3 @@
+# source file | classification of every low-level runtime-map writer
+src/config.cpp|configuration storage definitions and map mutation
+src/hdr_runtime_config_bridge.cpp|manager-owned publication bridge

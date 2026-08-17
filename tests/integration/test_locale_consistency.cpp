@@ -20,9 +20,16 @@ namespace {
 namespace fs = std::filesystem;
 using locale_set = std::set<std::string, std::less<>>;
 
+#ifndef SUNSHINE_SOURCE_DIR
+#define SUNSHINE_SOURCE_DIR "."
+#endif
+
+const fs::path repository_root = fs::path {SUNSHINE_SOURCE_DIR};
+
 locale_set extract_config_cpp_locales() {
   locale_set locales;
-  const std::string content = file_handler::read_file("src/config.cpp");
+  const auto config_path = repository_root / "src/config.cpp";
+  const std::string content = file_handler::read_file(config_path.string().c_str());
   const std::regex locale_section(R"(string_restricted_f\s*\(\s*vars\s*,\s*"locale"[^}]*\{([^}]*)\})");
   std::smatch match;
 
@@ -40,7 +47,7 @@ locale_set extract_config_cpp_locales() {
 
 locale_set get_available_locale_files() {
   locale_set locales;
-  const fs::path locale_dir = "src_assets/common/assets/web/public/assets/locale";
+  const fs::path locale_dir = repository_root / "src_assets/common/assets/web/public/assets/locale";
 
   if (!fs::exists(locale_dir)) {
     return locales;
@@ -56,10 +63,10 @@ locale_set get_available_locale_files() {
 }
 
 bool is_valid_locale_file(const std::string &locale) {
-  const std::string path = std::format("src_assets/common/assets/web/public/assets/locale/{}.json", locale);
+  const auto path = repository_root / "src_assets/common/assets/web/public/assets/locale" / (locale + ".json");
 
   try {
-    const auto parsed = nlohmann::json::parse(file_handler::read_file(path.c_str()));
+    const auto parsed = nlohmann::json::parse(file_handler::read_file(path.string().c_str()));
     return parsed.is_object() && !parsed.empty();
   } catch (const nlohmann::json::parse_error &) {
     return false;

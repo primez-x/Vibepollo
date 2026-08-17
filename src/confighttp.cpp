@@ -53,6 +53,7 @@
 #include "globals.h"
 #include "http_auth.h"
 #include "httpcommon.h"
+#include "http_request_view.h"
 #include "platform/common.h"
 #ifdef _WIN32
   #include "src/platform/windows/image_convert.h"
@@ -330,7 +331,7 @@ namespace confighttp {
   using https_server_t = SimpleWeb::Server<SimpleWeb::HTTPS>;
   using args_t = SimpleWeb::CaseInsensitiveMultimap;
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
-  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
+  using transport_req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
 
   bool is_token_route_eligible(std::string_view path) {
     return path.rfind("/api/", 0) == 0 && path.rfind("/api/auth/", 0) != 0;
@@ -536,27 +537,27 @@ namespace confighttp {
 
 #ifdef _WIN32
   // Forward declarations for Playnite handlers implemented in confighttp_playnite.cpp
-  void getPlayniteStatus(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void installPlaynite(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void uninstallPlaynite(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void getPlayniteGames(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void getPlayniteCategories(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void postPlayniteForceSync(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void postPlayniteCover(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void postPlayniteLaunch(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
+  void getPlayniteStatus(resp_https_t response, req_https_t request);
+  void installPlaynite(resp_https_t response, req_https_t request);
+  void uninstallPlaynite(resp_https_t response, req_https_t request);
+  void getPlayniteGames(resp_https_t response, req_https_t request);
+  void getPlayniteCategories(resp_https_t response, req_https_t request);
+  void postPlayniteForceSync(resp_https_t response, req_https_t request);
+  void postPlayniteCover(resp_https_t response, req_https_t request);
+  void postPlayniteLaunch(resp_https_t response, req_https_t request);
   // Helper to keep confighttp.cpp free of Playnite details
   void enhance_app_with_playnite_cover(nlohmann::json &input_tree);
   void enhance_app_with_playnite_icon(nlohmann::json &input_tree);
   // New: download Playnite-related logs as a ZIP
 
   // RTSS status endpoint (Windows-only)
-  void getRtssStatus(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void getLosslessScalingStatus(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void downloadPlayniteLogs(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void getCrashDumpStatus(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void postCrashDumpDismiss(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void getCrashBundleManifest(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
-  void downloadCrashBundle(std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request> request);
+  void getRtssStatus(resp_https_t response, req_https_t request);
+  void getLosslessScalingStatus(resp_https_t response, req_https_t request);
+  void downloadPlayniteLogs(resp_https_t response, req_https_t request);
+  void getCrashDumpStatus(resp_https_t response, req_https_t request);
+  void postCrashDumpDismiss(resp_https_t response, req_https_t request);
+  void getCrashBundleManifest(resp_https_t response, req_https_t request);
+  void downloadCrashBundle(resp_https_t response, req_https_t request);
   // Display helper: export current OS state as golden restore snapshot
   void postExportGoldenDisplay(resp_https_t response, req_https_t request);
   // Helper log readers (Windows-only)
@@ -578,22 +579,27 @@ namespace confighttp {
    * @param request The HTTP request object.
    */
   void print_req(const req_https_t &request) {
-    BOOST_LOG(debug) << "HTTP "sv << request->method << ' ' << request->path;
+    BOOST_LOG(debug) << "HTTP "sv << request.method << ' ' << request.path;
 
-    if (!request->header.empty()) {
+    if (!request.header.empty()) {
       BOOST_LOG(verbose) << "Headers:"sv;
-      for (auto &[name, val] : request->header) {
+      for (const auto &[name, val] : request.header) {
         BOOST_LOG(verbose) << name << " -- "
                            << (name == "Authorization" ? "CREDENTIALS REDACTED" : val);
       }
     }
 
-    auto query = request->parse_query_string();
-    if (!query.empty()) {
+    const auto &query_view = request.query;
+    if (!query_view.parameters.empty()) {
       BOOST_LOG(verbose) << "Query Params:"sv;
-      for (auto &[name, val] : query) {
+      for (const auto &[name, val] : query_view.parameters) {
         BOOST_LOG(verbose) << name << " -- " << val;
       }
+    }
+    if (query_view.status == http::client_hdr::capability_status::valid) {
+      BOOST_LOG(verbose) << "Client HDR capabilities: present"sv;
+    } else if (query_view.status == http::client_hdr::capability_status::invalid) {
+      BOOST_LOG(verbose) << "Client HDR capabilities: invalid"sv;
     }
   }
 
@@ -922,7 +928,7 @@ namespace confighttp {
    * @param request The HTTP request object.
    */
   void send_unauthorized(resp_https_t response, req_https_t request) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    auto address = net::addr_to_normalized_string(request.remote_endpoint.address());
     BOOST_LOG(info) << "Configuration API: ["sv << address << "] -- not authorized"sv;
 
     constexpr auto code = client_error_unauthorized;
@@ -947,7 +953,7 @@ namespace confighttp {
    * @param path The path to redirect to.
    */
   void send_redirect(resp_https_t response, req_https_t request, const char *path) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    auto address = net::addr_to_normalized_string(request.remote_endpoint.address());
     BOOST_LOG(info) << "Web UI: ["sv << address << "] -- redirecting"sv;
     const SimpleWeb::CaseInsensitiveMultimap headers {
       {"Location", path},
@@ -962,7 +968,7 @@ namespace confighttp {
    * @return True if the remote address is permitted, false otherwise (response set).
    */
   bool checkIPOrigin(resp_https_t response, req_https_t request) {
-    const auto remote_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    const auto remote_address = net::addr_to_normalized_string(request.remote_endpoint.address());
     const auto ip_type = net::from_address(remote_address);
     if (ip_type > http::origin_web_ui_allowed) {
       BOOST_LOG(info) << "Web UI: ["sv << remote_address << "] -- denied by origin policy"sv;
@@ -988,18 +994,18 @@ namespace confighttp {
    * @return AuthResult with outcome and response details if not authorized.
    */
   AuthResult check_auth(const req_https_t &request) {
-    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    auto address = net::addr_to_normalized_string(request.remote_endpoint.address());
     std::string auth_header;
     // Try Authorization header
-    if (auto auth_it = request->header.find("authorization"); auth_it != request->header.end()) {
+    if (auto auth_it = request.header.find("authorization"); auth_it != request.header.end()) {
       auth_header = auth_it->second;
     } else {
-      std::string token = extract_session_token_from_cookie(request->header);
+      std::string token = extract_session_token_from_cookie(request.header);
       if (!token.empty()) {
         auth_header = "Session " + token;
       }
     }
-    return check_auth(address, auth_header, request->path, request->method);
+    return check_auth(address, auth_header, request.path, request.method);
   }
 
   /**
@@ -1034,7 +1040,7 @@ namespace confighttp {
 
     try {
       display_device::DeviceEnumerationDetail detail = display_device::DeviceEnumerationDetail::Minimal;
-      const auto query = request->parse_query_string();
+      const auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
       if (const auto it = query.find("detail"); it != query.end()) {
         const auto value = boost::algorithm::to_lower_copy(it->second);
         if (value == "full") {
@@ -1069,7 +1075,7 @@ namespace confighttp {
     }
 
     try {
-      const auto query = request->parse_query_string();
+      const auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
       auto read_first = [&](std::initializer_list<std::string> keys) -> std::string {
         for (const auto &key : keys) {
           const auto it = query.find(key);
@@ -1266,10 +1272,10 @@ namespace confighttp {
   constexpr auto CSRF_TOKEN_LIFETIME = std::chrono::hours(1);
 
   std::string get_client_id(const req_https_t &request) {
-    if (const auto auth = request->header.find("authorization"); auth != request->header.end()) {
+    if (const auto auth = request.header.find("authorization"); auth != request.header.end()) {
       return auth->second;
     }
-    return net::addr_to_normalized_string(request->remote_endpoint().address());
+    return net::addr_to_normalized_string(request.remote_endpoint.address());
   }
 
   std::string generate_csrf_token(const std::string &client_id) {
@@ -1318,22 +1324,22 @@ namespace confighttp {
       });
     };
 
-    const auto origin_it = request->header.find("Origin");
-    if (origin_it != request->header.end() && is_allowed_origin(origin_it->second)) {
+    const auto origin_it = request.header.find("Origin");
+    if (origin_it != request.header.end() && is_allowed_origin(origin_it->second)) {
       return true;
     }
-    const auto referer_it = request->header.find("Referer");
-    if (referer_it != request->header.end() && is_allowed_origin(referer_it->second)) {
+    const auto referer_it = request.header.find("Referer");
+    if (referer_it != request.header.end() && is_allowed_origin(referer_it->second)) {
       return true;
     }
-    if (origin_it == request->header.end() && referer_it == request->header.end()) {
+    if (origin_it == request.header.end() && referer_it == request.header.end()) {
       return true;
     }
 
-    if (const auto header_it = request->header.find("X-CSRF-Token"); header_it != request->header.end()) {
+    if (const auto header_it = request.header.find("X-CSRF-Token"); header_it != request.header.end()) {
       return validate_stored_csrf_token(response, request, client_id, header_it->second);
     }
-    auto query_params = request->parse_query_string();
+    auto query_params = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
     if (const auto query_it = query_params.find("csrf_token"); query_it != query_params.end()) {
       return validate_stored_csrf_token(response, request, client_id, query_it->second);
     }
@@ -1388,8 +1394,8 @@ namespace confighttp {
    * @param contentType The required content type.
    */
   bool validateContentType(resp_https_t response, req_https_t request, const std::string_view &contentType) {
-    auto requestContentType = request->header.find("content-type");
-    if (requestContentType == request->header.end()) {
+    auto requestContentType = request.header.find("content-type");
+    if (requestContentType == request.header.end()) {
       bad_request(response, request, "Content type not provided");
       return false;
     }
@@ -1517,11 +1523,11 @@ namespace confighttp {
    */
   void getWebAsset(resp_https_t response, req_https_t request) {
     print_req(request);
-    if (request->path.size() <= 1) {
+    if (request.path.size() <= 1) {
       not_found(response, request);
       return;
     }
-    const std::string relative_path = request->path.substr(1);
+    const std::string relative_path = request.path.substr(1);
     serve_web_file(std::move(response), std::move(request), relative_path);
   }
 
@@ -1531,7 +1537,7 @@ namespace confighttp {
   void getWebUi(resp_https_t response, req_https_t request) {
     print_req(request);
 
-    const std::string &path = request->path;
+    const std::string &path = request.path;
     const std::string_view path_view {path};
     static constexpr std::array reserved_prefixes {"/api"sv, "/assets"sv, "/covers"sv, "/images"sv};
     if (std::ranges::any_of(reserved_prefixes, [&path](std::string_view prefix) {
@@ -1616,7 +1622,7 @@ namespace confighttp {
     fs::path nodeModulesPath(webDirPath / "assets");
 
     // .relative_path is needed to shed any leading slash that might exist in the request path
-    auto filePath = fs::weakly_canonical(webDirPath / fs::path(request->path).relative_path());
+    auto filePath = fs::weakly_canonical(webDirPath / fs::path(request.path).relative_path());
 
     // Don't do anything if file does not exist or is outside the assets directory
     if (!isChildPath(filePath, nodeModulesPath)) {
@@ -1899,7 +1905,7 @@ namespace confighttp {
     print_req(request);
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
 
     BOOST_LOG(info) << config::stream.file_apps;
     try {
@@ -2030,7 +2036,7 @@ namespace confighttp {
     print_req(request);
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       if (!input_tree.is_object()) {
@@ -2084,12 +2090,12 @@ namespace confighttp {
 
     print_req(request);
 
-    if (request->path_match.size() < 2) {
+    if (request.path_match.size() < 2) {
       bad_request(response, request, "Application uuid required");
       return;
     }
 
-    std::string uuid = request->path_match[1];
+    std::string uuid = request.path_match[1];
     if (uuid.empty()) {
       bad_request(response, request, "Application uuid required");
       return;
@@ -2140,8 +2146,8 @@ namespace confighttp {
     }
 
     std::string uuid;
-    if (request->path_match.size() > 1) {
-      uuid = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      uuid = request.path_match[1];
     }
     if (uuid.empty()) {
       bad_request(response, request, "Missing application uuid");
@@ -2239,7 +2245,7 @@ namespace confighttp {
 
     try {
       std::stringstream ss;
-      ss << request->content.rdbuf();
+      ss << request.body;
 
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
@@ -2351,11 +2357,11 @@ namespace confighttp {
 
     print_req(request);
 
-    const bool is_delete_method = request->method == "DELETE";
+    const bool is_delete_method = request.method == "DELETE";
     std::optional<std::string> token_from_path;
     std::optional<size_t> index_from_path;
-    if (request->path_match.size() > 1) {
-      token_from_path = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      token_from_path = request.path_match[1];
       try {
         index_from_path = static_cast<size_t>(std::stoul(*token_from_path));
       } catch (...) {
@@ -2363,7 +2369,7 @@ namespace confighttp {
     }
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     std::string raw_body = ss.str();
 
     std::optional<std::string> uuid;
@@ -2649,7 +2655,7 @@ namespace confighttp {
     print_req(request);
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
 
     try {
       const nlohmann::json input_tree = nlohmann::json::parse(ss);
@@ -2688,7 +2694,7 @@ namespace confighttp {
     print_req(request);
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
@@ -2824,7 +2830,7 @@ namespace confighttp {
     print_req(request);
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
@@ -3055,7 +3061,7 @@ namespace confighttp {
     print_req(request);
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       // TODO: Input Validation
       std::stringstream config_stream;
@@ -3137,7 +3143,7 @@ namespace confighttp {
     print_req(request);
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json output_tree;
       nlohmann::json patch_tree = nlohmann::json::parse(ss);
@@ -3304,7 +3310,7 @@ namespace confighttp {
 
     int limit = 25;
     int offset = 0;
-    auto query = request->parse_query_string();
+    auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
     auto it_limit = query.find("limit");
     if (it_limit != query.end()) {
       try { limit = std::stoi(it_limit->second); } catch (...) {}
@@ -3330,8 +3336,8 @@ namespace confighttp {
       return;
     }
 
-    auto uuid = request->path_match[1].str();
-    const auto query = request->parse_query_string();
+    auto uuid = request.path_match[1];
+    const auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
     const bool include_all = [&query]() {
       auto it = query.find("full");
       if (it == query.end()) {
@@ -3356,7 +3362,7 @@ namespace confighttp {
       return;
     }
 
-    auto uuid = request->path_match[1].str();
+    auto uuid = request.path_match[1];
     auto result = session_history::delete_session(uuid);
     switch (result) {
       case session_history::delete_result_e::deleted:
@@ -3475,7 +3481,7 @@ namespace confighttp {
 
     webrtc_stream::SessionOptions options;
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     auto body = ss.str();
     if (!body.empty()) {
       if (!check_content_type(response, request, "application/json")) {
@@ -3713,8 +3719,8 @@ namespace confighttp {
     }
 
     std::string session_id;
-    if (request->path_match.size() > 1) {
-      session_id = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      session_id = request.path_match[1];
     }
 
     auto session = webrtc_stream::get_session(session_id);
@@ -3734,8 +3740,8 @@ namespace confighttp {
     }
 
     std::string session_id;
-    if (request->path_match.size() > 1) {
-      session_id = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      session_id = request.path_match[1];
     }
 
     nlohmann::json output;
@@ -3756,12 +3762,12 @@ namespace confighttp {
     }
 
     std::string session_id;
-    if (request->path_match.size() > 1) {
-      session_id = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      session_id = request.path_match[1];
     }
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json input = nlohmann::json::parse(ss.str());
       auto sdp = input.at("sdp").get<std::string>();
@@ -3809,8 +3815,8 @@ namespace confighttp {
     }
 
     std::string session_id;
-    if (request->path_match.size() > 1) {
-      session_id = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      session_id = request.path_match[1];
     }
 
     std::string answer_sdp;
@@ -3838,12 +3844,12 @@ namespace confighttp {
     }
 
     std::string session_id;
-    if (request->path_match.size() > 1) {
-      session_id = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      session_id = request.path_match[1];
     }
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json input = nlohmann::json::parse(ss.str());
       nlohmann::json output;
@@ -3903,12 +3909,12 @@ namespace confighttp {
     }
 
     std::string session_id;
-    if (request->path_match.size() > 1) {
-      session_id = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      session_id = request.path_match[1];
     }
 
     std::size_t since = 0;
-    auto query = request->parse_query_string();
+    auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
     auto since_it = query.find("since");
     if (since_it != query.end()) {
       try {
@@ -3943,8 +3949,8 @@ namespace confighttp {
     }
 
     std::string session_id;
-    if (request->path_match.size() > 1) {
-      session_id = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      session_id = request.path_match[1];
     }
 
     if (!webrtc_stream::get_session(session_id)) {
@@ -3953,7 +3959,7 @@ namespace confighttp {
     }
 
     std::size_t since = 0;
-    auto query = request->parse_query_string();
+    auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
     auto since_it = query.find("since");
     if (since_it != query.end()) {
       try {
@@ -4069,7 +4075,7 @@ namespace confighttp {
     print_req(request);
 
     try {
-      const int index = std::stoi(request->path_match[1]);
+      const int index = std::stoi(request.path_match[1]);
       if (!check_app_index(response, request, index)) {
         return;
       }
@@ -4128,7 +4134,7 @@ namespace confighttp {
 
     std::stringstream ss;
 
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
@@ -4320,7 +4326,7 @@ namespace confighttp {
 
     std::string content;
     std::string source = "sunshine";
-    const auto query = request->parse_query_string();
+    const auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
     if (const auto it = query.find("source"); it != query.end() && !it->second.empty()) {
       source = it->second;
       boost::algorithm::to_lower(source);
@@ -4414,7 +4420,7 @@ namespace confighttp {
     print_req(request);
     std::vector<std::string> errors;
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
@@ -4481,7 +4487,7 @@ namespace confighttp {
     nlohmann::json output_tree;
     try {
       std::stringstream ss;
-      ss << request->content.rdbuf();
+      ss << request.body;
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
 
       std::string passphrase = input_tree.value("passphrase", "");
@@ -4529,7 +4535,7 @@ namespace confighttp {
 
     try {
       std::stringstream ss;
-      ss << request->content.rdbuf();
+      ss << request.body;
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       nlohmann::json output_tree;
       std::string pin = input_tree.value("pin", "");
@@ -5073,7 +5079,7 @@ namespace confighttp {
     std::string current_mismatch_reason;
     std::optional<golden_restore_status_t> restore_status;
     try {
-      const auto query = request->parse_query_string();
+      const auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
       const auto compare_current_it = query.find("compare_current");
       const bool compare_current = compare_current_it != query.end() &&
                                    (boost::iequals(compare_current_it->second, "1") ||
@@ -5283,7 +5289,7 @@ namespace confighttp {
     }
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     const std::string request_body = ss.str();
     auto token_opt = api_token_manager.generate_api_token(request_body, config::sunshine.username);
     nlohmann::json output_tree;
@@ -5362,8 +5368,8 @@ namespace confighttp {
       return;
     }
     std::string hash;
-    if (request->path_match.size() > 1) {
-      hash = request->path_match[1];
+    if (request.path_match.size() > 1) {
+      hash = request.path_match[1];
     }
     bool result = api_token_manager.revoke_api_token_by_hash(hash);
     nlohmann::json output_tree;
@@ -5392,7 +5398,7 @@ namespace confighttp {
 
     try {
       std::stringstream ss;
-      ss << request->content.rdbuf();
+      ss << request.body;
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
 
       if (!input_tree.contains("uuid") || !input_tree["uuid"].is_string()) {
@@ -5413,7 +5419,8 @@ namespace confighttp {
           BOOST_LOG(info) << "Launching app ["sv << app.name << "] from web UI"sv;
           (void) proc::proc.running();
           std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
-          auto launch_session = nvhttp::make_launch_session(true, false, request->parse_query_string(), &named_cert);
+          const auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
+          auto launch_session = nvhttp::make_launch_session(true, false, query, &named_cert);
           auto err = proc::proc.execute(app, launch_session);
           if (err) {
             bad_request(response, request, err == 503 ? "Failed to initialize video capture/encoding. Is a display connected and turned on?" : "Failed to start the specified application");
@@ -5446,7 +5453,7 @@ namespace confighttp {
 
     try {
       std::stringstream ss;
-      ss << request->content.rdbuf();
+      ss << request.body;
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       std::string uuid = input_tree.value("uuid", "");
@@ -5653,7 +5660,7 @@ namespace confighttp {
     }
 
     try {
-      auto query_params = request->parse_query_string();
+      auto query_params = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
       const auto type_it = query_params.find("type");
       const std::string type_str = type_it == query_params.end() ? "any" : type_it->second;
       const auto path_it = query_params.find("path");
@@ -5698,30 +5705,40 @@ namespace confighttp {
     auto address_family = net::af_from_enum_string(config::sunshine.address_family);
 
     https_server_t server(config::nvhttp.cert, config::nvhttp.pkey);
-    server.default_resource["DELETE"] = [](resp_https_t response, req_https_t request) {
-      bad_request(response, request);
+    auto adapt_request = [](auto handler) {
+      return [handler = std::move(handler)](resp_https_t response, transport_req_https_t request) mutable {
+        handler(
+          std::move(response),
+          http::client_hdr::make_request_view(request, true)
+        );
+      };
     };
-    server.default_resource["PATCH"] = [](resp_https_t response, req_https_t request) {
-      bad_request(response, request);
-    };
-    server.default_resource["POST"] = [](resp_https_t response, req_https_t request) {
-      bad_request(response, request);
-    };
-    server.default_resource["PUT"] = [](resp_https_t response, req_https_t request) {
-      bad_request(response, request);
-    };
+
+    server.default_resource["DELETE"] = adapt_request([](resp_https_t response, req_https_t request) {
+      bad_request(std::move(response), std::move(request));
+    });
+    server.default_resource["PATCH"] = adapt_request([](resp_https_t response, req_https_t request) {
+      bad_request(std::move(response), std::move(request));
+    });
+    server.default_resource["POST"] = adapt_request([](resp_https_t response, req_https_t request) {
+      bad_request(std::move(response), std::move(request));
+    });
+    server.default_resource["PUT"] = adapt_request([](resp_https_t response, req_https_t request) {
+      bad_request(std::move(response), std::move(request));
+    });
 
     // Static browser assets are public; every state-changing API below still
     // passes through the existing authentication and CSRF gates.
-    server.resource["^/(assets|images)/.+$"]["GET"] = getWebAsset;
-    server.resource["^/v2/(assets|images)/.+$"]["GET"] = getWebAsset;
-    server.resource["^/v2/[^/]+\\.webmanifest$"]["GET"] = getWebAsset;
-    server.default_resource["GET"] = getWebUi;
+    server.resource["^/(assets|images)/.+$"]["GET"] = adapt_request(getWebAsset);
+    server.resource["^/v2/(assets|images)/.+$"]["GET"] = adapt_request(getWebAsset);
+    server.resource["^/v2/[^/]+\\.webmanifest$"]["GET"] = adapt_request(getWebAsset);
+    server.default_resource["GET"] = adapt_request(getWebUi);
     thread_pool_util::ThreadPool blocking_route_pool;
     blocking_route_pool.start(1);
     clear_token_route_catalog();
     auto register_api_route = [&](const char *pattern, const char *method, const auto &handler) {
-      server.resource[pattern][method] = [method, handler](resp_https_t response, req_https_t request) {
+      server.resource[pattern][method] = [method, handler](resp_https_t response, transport_req_https_t transport_request) {
+        auto request = http::client_hdr::make_request_view(transport_request, true);
         const std::string_view verb {method};
         if (verb == "POST" || verb == "PATCH" || verb == "PUT" || verb == "DELETE") {
           const auto client_id = get_client_id(request);
@@ -5845,16 +5862,16 @@ namespace confighttp {
     register_api_route("^/api/logs/export_crash/manifest$", "GET", getCrashBundleManifest);
     register_api_route("^/api/logs/export_crash$", "GET", downloadCrashBundle);
 #endif
-    server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
-    server.resource["^/images/logo-apollo-45.png$"]["GET"] = getApolloLogoImage;
-    server.resource["^/images/logo-sunshine-45.png$"]["GET"] = getApolloLogoImage;  // legacy alias
-    server.resource["^/assets\\/.+$"]["GET"] = getNodeModules;
+    server.resource["^/images/sunshine.ico$"]["GET"] = adapt_request(getFaviconImage);
+    server.resource["^/images/logo-apollo-45.png$"]["GET"] = adapt_request(getApolloLogoImage);
+    server.resource["^/images/logo-sunshine-45.png$"]["GET"] = adapt_request(getApolloLogoImage);  // legacy alias
+    server.resource["^/assets\\/.+$"]["GET"] = adapt_request(getNodeModules);
     register_api_route("^/api/token$", "POST", generateApiToken);
     register_api_route("^/api/tokens$", "GET", listApiTokens);
     register_api_route("^/api/token/routes$", "GET", listApiTokenRoutes);
     register_api_route("^/api/token/([a-fA-F0-9]+)$", "DELETE", revokeApiToken);
     // Session validation endpoint used by the web UI to detect HttpOnly session cookies
-    server.resource["^/api-tokens/?$"]["GET"] = getTokenPage;
+    server.resource["^/api-tokens/?$"]["GET"] = adapt_request(getTokenPage);
     register_api_route("^/api/auth/login$", "POST", loginUser);
     register_api_route("^/api/auth/refresh$", "POST", refreshSession);
     register_api_route("^/api/auth/logout$", "POST", logoutUser);
@@ -5974,7 +5991,7 @@ namespace confighttp {
     print_req(request);
 
     std::stringstream ss;
-    ss << request->content.rdbuf();
+    ss << request.body;
     try {
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       if (!input_tree.contains("username") || !input_tree.contains("password")) {
@@ -5995,10 +6012,10 @@ namespace confighttp {
       }
 
       std::string user_agent;
-      if (auto ua = request->header.find("user-agent"); ua != request->header.end()) {
+      if (auto ua = request.header.find("user-agent"); ua != request.header.end()) {
         user_agent = ua->second;
       }
-      std::string remote_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+      std::string remote_address = net::addr_to_normalized_string(request.remote_endpoint.address());
 
       APIResponse api_response = session_token_api.login(username, password, redirect_url, remember_me, user_agent, remote_address);
       write_api_response(response, api_response);
@@ -6013,18 +6030,18 @@ namespace confighttp {
     print_req(request);
 
     std::string refresh_token;
-    if (auto auth = request->header.find("authorization");
-        auth != request->header.end() && auth->second.rfind("Refresh ", 0) == 0) {
+    if (auto auth = request.header.find("authorization");
+        auth != request.header.end() && auth->second.rfind("Refresh ", 0) == 0) {
       refresh_token = auth->second.substr(8);
     }
     if (refresh_token.empty()) {
-      refresh_token = extract_refresh_token_from_cookie(request->header);
+      refresh_token = extract_refresh_token_from_cookie(request.header);
     }
 
     // Allow JSON body input for API clients that do not rely on cookies/Authorization header
     if (refresh_token.empty()) {
       std::stringstream ss;
-      ss << request->content.rdbuf();
+      ss << request.body;
       if (!ss.str().empty()) {
         try {
           auto body = nlohmann::json::parse(ss);
@@ -6037,10 +6054,10 @@ namespace confighttp {
     }
 
     std::string user_agent;
-    if (auto ua = request->header.find("user-agent"); ua != request->header.end()) {
+    if (auto ua = request.header.find("user-agent"); ua != request.header.end()) {
       user_agent = ua->second;
     }
-    std::string remote_address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    std::string remote_address = net::addr_to_normalized_string(request.remote_endpoint.address());
 
     APIResponse api_response = session_token_api.refresh_session(refresh_token, user_agent, remote_address);
     write_api_response(response, api_response);
@@ -6057,15 +6074,15 @@ namespace confighttp {
     print_req(request);
 
     std::string session_token;
-    if (auto auth = request->header.find("authorization");
-        auth != request->header.end() && auth->second.rfind("Session ", 0) == 0) {
+    if (auto auth = request.header.find("authorization");
+        auth != request.header.end() && auth->second.rfind("Session ", 0) == 0) {
       session_token = auth->second.substr(8);
     }
     if (session_token.empty()) {
-      session_token = extract_session_token_from_cookie(request->header);
+      session_token = extract_session_token_from_cookie(request.header);
     }
 
-    std::string refresh_token = extract_refresh_token_from_cookie(request->header);
+    std::string refresh_token = extract_refresh_token_from_cookie(request.header);
 
     APIResponse api_response = session_token_api.logout(session_token, refresh_token);
     write_api_response(response, api_response);
@@ -6078,12 +6095,12 @@ namespace confighttp {
     print_req(request);
 
     std::string raw_token;
-    if (auto auth = request->header.find("authorization");
-        auth != request->header.end() && auth->second.rfind("Session ", 0) == 0) {
+    if (auto auth = request.header.find("authorization");
+        auth != request.header.end() && auth->second.rfind("Session ", 0) == 0) {
       raw_token = auth->second.substr(8);
     }
     if (raw_token.empty()) {
-      raw_token = extract_session_token_from_cookie(request->header);
+      raw_token = extract_session_token_from_cookie(request.header);
     }
     std::string active_hash;
     if (!raw_token.empty()) {
@@ -6102,19 +6119,19 @@ namespace confighttp {
     }
     print_req(request);
 
-    if (request->path_match.size() < 2) {
+    if (request.path_match.size() < 2) {
       bad_request(response, request, "Session id required");
       return;
     }
-    std::string session_hash = request->path_match[1].str();
+    std::string session_hash = request.path_match[1];
 
     std::string raw_token;
-    if (auto auth = request->header.find("authorization");
-        auth != request->header.end() && auth->second.rfind("Session ", 0) == 0) {
+    if (auto auth = request.header.find("authorization");
+        auth != request.header.end() && auth->second.rfind("Session ", 0) == 0) {
       raw_token = auth->second.substr(8);
     }
     if (raw_token.empty()) {
-      raw_token = extract_session_token_from_cookie(request->header);
+      raw_token = extract_session_token_from_cookie(request.header);
     }
     bool is_current = false;
     if (!raw_token.empty()) {
@@ -6160,10 +6177,10 @@ namespace confighttp {
         authenticated = true;  // check_auth returns ok for public routes; refine below
         // We only consider it authenticated if an auth header or cookie was present and validated.
         std::string auth_header;
-        if (auto auth_it = request->header.find("authorization"); auth_it != request->header.end()) {
+        if (auto auth_it = request.header.find("authorization"); auth_it != request.header.end()) {
           auth_header = auth_it->second;
         } else {
-          std::string token = extract_session_token_from_cookie(request->header);
+          std::string token = extract_session_token_from_cookie(request.header);
           if (!token.empty()) {
             auth_header = "Session " + token;
           }
@@ -6172,7 +6189,7 @@ namespace confighttp {
           authenticated = false;  // public access granted but no credentials supplied
         } else {
           // Re-run only auth layer for supplied header specifically to ensure validity
-          auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+          auto address = net::addr_to_normalized_string(request.remote_endpoint.address());
           auto header_check = check_auth(address, auth_header, "/api/config", "GET");  // use protected path for validation
           authenticated = header_check.ok;
         }

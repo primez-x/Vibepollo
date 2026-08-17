@@ -719,6 +719,10 @@
                     </p>
                   </div>
 
+                  <p v-if="isWindows" class="text-xs opacity-70 lg:col-span-2">
+                    {{ t('clients.hdr_profile_desc') }}
+                  </p>
+
                   <n-form-item v-if="isWindows" :label="t('clients.hdr_profile_label')">
                     <n-select
                       v-model:value="client.editHdrProfile"

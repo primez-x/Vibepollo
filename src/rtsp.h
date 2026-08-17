@@ -6,6 +6,7 @@
 
 // standard includes
 #include "config.h"
+#include "client_hdr_capabilities.h"
 #include "framegen_policy.h"
 
 #include <array>
@@ -57,6 +58,17 @@ namespace rtsp_stream {
     std::string client_uuid;
     std::string client_name;
     std::optional<std::string> hdr_profile;
+    std::optional<client_hdr::capabilities_t> client_hdr_capabilities;
+    struct hdr_peak_resolution_t {
+      std::uint32_t reported_peak_nits = 0;
+      std::uint32_t effective_peak_nits = 0;
+      std::string source;
+      bool inherited_from_active_session = false;
+    };
+    std::optional<hdr_peak_resolution_t> hdr_peak_resolution;
+    std::uint64_t hdr_runtime_generation = 0;
+    std::uint64_t hdr_runtime_owner_token = 0;
+    std::uint64_t hdr_runtime_cohort_participant = 0;
     crypto::PERM perm;
     int appid;
 

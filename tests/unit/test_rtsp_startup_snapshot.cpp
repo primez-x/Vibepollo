@@ -29,6 +29,20 @@ namespace {
     ls.unique_id = "unique-id";
     ls.client_uuid = "client-uuid";
     ls.device_name = "device-name";
+    ls.hdr_profile = "manual-profile";
+    client_hdr::capabilities_t client_hdr_capabilities;
+    client_hdr_capabilities.calibrated = client_hdr::peak_t {1000, "windows-icc-mhc2"};
+    client_hdr_capabilities.display_reported = client_hdr::peak_t {1200, "dxgi-output"};
+    ls.client_hdr_capabilities = std::move(client_hdr_capabilities);
+    ls.hdr_peak_resolution = rtsp_stream::launch_session_t::hdr_peak_resolution_t {
+      .reported_peak_nits = 1200,
+      .effective_peak_nits = 1000,
+      .source = "windows-icc-mhc2",
+      .inherited_from_active_session = true,
+    };
+    ls.hdr_runtime_generation = 17;
+    ls.hdr_runtime_owner_token = 23;
+    ls.hdr_runtime_cohort_participant = 29;
     ls.perm = crypto::PERM::_all;
     ls.fps = 120;
     ls.client_do_cmds.push_back(crypto::command_entry_t {"do-cmd", true});
@@ -77,6 +91,16 @@ TEST(RtspStartupSnapshot, CopiesAllConsumedFields) {
   EXPECT_EQ(clone->unique_id, source.unique_id);
   EXPECT_EQ(clone->client_uuid, source.client_uuid);
   EXPECT_EQ(clone->device_name, source.device_name);
+  EXPECT_EQ(clone->hdr_profile, source.hdr_profile);
+  EXPECT_EQ(clone->client_hdr_capabilities, source.client_hdr_capabilities);
+  ASSERT_TRUE(clone->hdr_peak_resolution.has_value());
+  EXPECT_EQ(clone->hdr_peak_resolution->reported_peak_nits, 1200u);
+  EXPECT_EQ(clone->hdr_peak_resolution->effective_peak_nits, 1000u);
+  EXPECT_EQ(clone->hdr_peak_resolution->source, "windows-icc-mhc2");
+  EXPECT_TRUE(clone->hdr_peak_resolution->inherited_from_active_session);
+  EXPECT_EQ(clone->hdr_runtime_generation, source.hdr_runtime_generation);
+  EXPECT_EQ(clone->hdr_runtime_owner_token, source.hdr_runtime_owner_token);
+  EXPECT_EQ(clone->hdr_runtime_cohort_participant, source.hdr_runtime_cohort_participant);
   EXPECT_EQ(clone->perm, source.perm);
   EXPECT_EQ(clone->fps, source.fps);
 

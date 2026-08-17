@@ -631,6 +631,10 @@ Streaming HDR content is officially supported on Windows hosts and experimentall
     (and probably overexposed if your host is HDR).
   * A good HDR experience relies on proper HDR display calibration both in the OS and in game. HDR calibration can
     differ significantly between client and host displays.
+  * On a supported Windows Desktop Moonlight client, automatic mode uses the client's normalized calibrated display
+    specifications when available, then the active display's Windows/DXGI-reported display descriptor (not a raw EDID
+    transfer), and finally the host defaults. Only normalized display specifications (currently peak luminance in
+    nits) are used; Vibepollo never receives or stores the client's ICC file.
   * You may also need to tune the brightness slider or HDR calibration options in game to the different HDR brightness
     capabilities of your client's display.
   * Some GPUs video encoders can produce lower image quality or encoding performance when streaming in HDR compared
@@ -641,7 +645,15 @@ Additional information:
 @tabs{
   @tab{ Windows |
   - HDR streaming is supported for Intel, AMD, and NVIDIA GPUs that support encoding HEVC Main 10 or AV1 10-bit profiles.
-  - We recommend calibrating the display by streaming the Windows HDR Calibration app to your client device and saving an HDR calibration profile to use while streaming.
+  - Leave the client HDR profile set to `Automatic (client display capabilities when available)` when using a supported
+    Windows Desktop Moonlight client. It reports the active display's calibrated Windows values before launch or resume
+    when available, then falls back to the active display's Windows/DXGI-reported values and host defaults.
+  - For a host-side manual override, run Windows HDR Calibration on the host display, save the host profile, and select
+    it under Clients → Manual HDR color profile. Use this for a fixed display, a handheld or tablet client, or manual
+    tuning. A selected host profile suppresses client-reported values; a manual peak-brightness value overrides both.
+  - With the Sunshine/Vibepollo virtual-display backend, the resolved peak can set the virtual display HDR target.
+    SudoVDA does not accept a new luminance argument in v1, so automatic peak data is runtime-only there and can still
+    feed RTX HDR. Native HDR content and mastering metadata remain source-driven.
   - Older games that use NVIDIA-specific NVAPI HDR rather than native Windows HDR support may not display properly in HDR.
   }
 

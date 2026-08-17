@@ -160,8 +160,11 @@ protocol, while its request logger and generic query parser consume the same
 sanitized view. The route-inventory check covers both HTTP surfaces, so a
 capability-shaped secret cannot appear in either logger or parser.
 
-The initial configuration-surface inventory is `confighttp.cpp:5701-5857` for
-all default/resource registrations, `confighttp.cpp:580-595,1037,1072,1336,
+The initial configuration-surface inventory is `confighttp.cpp:5701-5863` for
+all default/resource registrations, including the six auth routes at
+`confighttp.cpp:5858-5863`, with auth handlers at
+`confighttp.cpp:5974,6013,6057,6078,6103,6152`. The remaining inventory is
+`confighttp.cpp:580-595,1037,1072,1336,
 3307,3334,3911,3956,4323,5076,5416,5656` for logger/parser and web-UI launch
 seams, `confighttp_rtss.cpp:38,95,233-235`, and
 `confighttp_playnite.cpp:62,130,228,258,288,320,372,411,425,468,1349,2137,
@@ -298,20 +301,29 @@ GUI-thread
 probe window. It rechecks the selected screen, calls
 `SDL_GetWindowDisplayIndex()`, re-collects the complete identity/descriptor
 when the mapping changed, and clears the value if validation fails. Only then
-does it atomically move the value-only launch snapshot and generation into the
-worker constructor, destroy the probe window on the GUI thread, and mark the
+does it construct a complete immutable `connection_start_request_t` containing
+every worker input (host, app, stream configuration, client preference/input
+mask, server advertisement, encoded capability snapshot, generation, and
+callback routing), transfer only that value into an owned worker handle, and
+then construct the worker, destroy the probe window on the GUI thread, and mark the
 state `handed-off`. Repeated `start()` is rejected or idempotently returns
 without creating a second worker. Replace the current worker's direct
 `Session*`, `m_AsyncConnectionSuccess` mutation, and direct success/error side
-effects with a value-only `connection_start_result_t { generation, success,
-error }` signal. A queued GUI-thread slot alone validates generation and active
-state before mutating `Session`, emitting UI signals, or entering `exec`;
-cancellation invalidates the generation before signaling the worker. Worker
+effects with generation-tagged value callback events and a value-only
+`connection_start_result_t { generation, success, error }` result. The worker
+and all start-phase Limelight callbacks must not access `Session`; only queued
+GUI-thread slots validate generation and active state before mutating `Session`,
+emitting UI signals, or entering `exec`. Cancellation invalidates the
+generation before signaling the worker, checks cancellation before and after
+`startApp()` and before `LiStartConnection`, and invokes the appropriate
+connection interruption. Worker
 completion is accepted only when its generation equals the handed-off
 generation and the session remains active; late completion after cancellation,
 stop, destruction, or a newer start is discarded. The worker performs no
 QScreen, SDL, DISPLAYCONFIG, DXGI, or Windows ColorProfile calls and cannot
-mutate `Session`. The remaining race after this handoff is a documented v1
+mutate `Session`. GUI-owned active-session cleanup is released exactly once on
+success, failure, cancellation, destruction, or stale result. The remaining
+race after this handoff is a documented v1
 limitation; no later renegotiation is attempted.
 
 ## Vibepollo host integration
@@ -340,8 +352,12 @@ The host parses `clientDisplayCapabilities` for both launch verbs before
 computing runtime overrides and stores the validated result on
 `launch_session_t`. It must remain separate from the persistent
 `crypto::named_device_t::hdr_profile` field so client data cannot silently
-become a saved host configuration. `clone_for_startup()` must copy the new
-field explicitly.
+become a saved host configuration. `clone_for_startup()` must explicitly copy
+or transfer the complete startup HDR contract: client capability snapshot,
+resolved peak state, owner generation/token, and awaiting-stream cohort
+participant token. WebRTC capture and session creation must perform the
+equivalent owner-token transfer rather than reconstructing ownership from
+defaults.
 
 Client-derived policy uses one canonical effective-HDR resolver shared by
 session construction and peak policy. Before evaluating it, launch/resume
@@ -415,8 +431,9 @@ is the sole production authority for the complete runtime override map:
 low-level whole-map set/clear functions are private to it, and unrelated-key
 edits use manager transactions under the same gate. Every transaction advances
 a monotonic map revision. A generation-checked lease stores the proposed
-owner token, prior map, prior owner, candidate map, owned HDR keys, map
-revision, and phase (`provisional`, `awaiting-stream`, `active`, or
+owner token, prior map, prior owner, candidate map, a per-key candidate delta
+for every changed key (prior presence/value and candidate presence/value),
+owned HDR keys, map revision, and phase (`provisional`, `awaiting-stream`, `active`, or
 `retained-paused`).
 
 An idle launch/resume begins a lease and publishes the candidate map; HTTP
@@ -425,10 +442,11 @@ joins bind participant tokens to that awaiting-stream cohort. The first
 RTSP/WebRTC ownership publication from any participant commits the cohort's
 matching generation; canceling one participant removes only that participant.
 Rollback is permitted only after the cohort has no pending participants and no
-active publication. When rollback is permitted, it restores only lease-owned
-HDR entries if the generation is current and those entries still equal the
-candidate values; it preserves unrelated current keys and newer explicit HDR
-edits. Synchronous errors, pending-session cancellation/expiry,
+active publication. When rollback is permitted, it conditionally restores
+every candidate-owned key if the generation is current and its current value
+still equals the candidate value; the recorded prior presence/value is
+restored or the key is removed, while an independently changed or newly added
+value survives. Synchronous errors, pending-session cancellation/expiry,
 virtual-display failure, and asynchronous stream-start failure roll back the
 matching lease under the gate. A stale rollback cannot overwrite a newer
 generation. A join copies the active owner's target without opening a separate
@@ -522,8 +540,8 @@ translation/fallback conventions rather than replacing unrelated translations.
   `clientDisplayCapabilities` value before parsing, case-insensitively and for
   every route, regardless of validity or size. Runtime logs identify the
   selected source and fallback reason without exposing raw profile data.
-- Moonlight's verbose URL logging also removes or replaces the complete
-  `clientDisplayCapabilities` query value before logging. The client must not
+- Moonlight's normal, timeout, and error URL logging also removes or replaces
+  the complete `clientDisplayCapabilities` query value before logging. The client must not
   log the serialized base64/JSON capability merely because it contains no raw
   ICC bytes.
 

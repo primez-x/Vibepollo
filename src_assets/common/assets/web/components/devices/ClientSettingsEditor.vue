@@ -670,13 +670,13 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
       <div class="client-settings-section__heading">
         <div>
           <h3 :id="`${controlIdPrefix}-hdr-settings`">{{ t('ui.devices.editor.sections.hdr') }}</h3>
-          <p>{{ t('ui.devices.editor.hdr_description') }}</p>
+          <p>{{ t('clients.hdr_profile_desc') }}</p>
         </div>
       </div>
       <div class="vs-settings-group">
         <SettingRow
           :label="t('clients.hdr_profile_label')"
-          :description="t('ui.devices.editor.hdr_profile_description')"
+          :description="t('clients.hdr_profile_desc')"
           :control-id="`${controlIdPrefix}-hdr-profile`"
         >
           <div class="client-settings-control-stack">
@@ -713,7 +713,7 @@ function applyDisplaySelection(selection: ClientDisplaySelection): void {
         </SettingRow>
         <SettingRow
           :label="t('clients.hdr_peak_nits_label')"
-          :description="t('ui.devices.editor.hdr_peak_description')"
+          :description="t('clients.hdr_peak_nits_desc')"
           :control-id="`${controlIdPrefix}-hdr-peak`"
         >
           <input

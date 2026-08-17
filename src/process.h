@@ -11,6 +11,7 @@
 // standard includes
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -249,6 +250,14 @@ namespace proc {
   private:
     int launch_app_commands(bool stream_lifecycle_lock_held);
 
+#ifdef _WIN32
+    bool update_active_app_live_rtx_hdr_overrides_impl(
+      const std::string &app_uuid,
+      const std::unordered_map<std::string, std::string> &rtx_hdr_overrides,
+      std::uint64_t observed_app_revision
+    );
+#endif
+
     std::atomic<int> _app_id {0};
     std::string _app_name;
 
@@ -259,6 +268,7 @@ namespace proc {
     ctx_t _app;
     std::chrono::steady_clock::time_point _app_launch_time;
     std::string _active_client_uuid;
+    std::uint64_t _app_state_revision {0};
 
     mutable std::mutex _apps_mutex;
 

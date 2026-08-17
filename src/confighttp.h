@@ -21,6 +21,7 @@
 // local includes
 #include "config_http_policy.h"
 #include "http_auth.h"
+#include "http_request_view.h"
 #include "thread_safe.h"
 
 #include <Simple-Web-Server/server_https.hpp>
@@ -31,7 +32,7 @@ using namespace std::chrono_literals;
 
 namespace confighttp {
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
-  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
+  using req_https_t = http::client_hdr::request_view;
 
   constexpr auto PORT_HTTPS = policy::https_port_offset;
   constexpr auto SESSION_EXPIRE_DURATION = 24h * 15;

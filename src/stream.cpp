@@ -40,6 +40,7 @@ extern "C" {
 #include "display_device.h"
 #include "display_helper_integration.h"
 #include "globals.h"
+#include "hdr_runtime_owner.h"
 #include "input.h"
 #include "logging.h"
 #include "network.h"
@@ -2719,13 +2720,25 @@ namespace stream {
         return false;
       }
 
+      // The runtime HDR target follows the same shared owner boundary as the
+      // capture/display cleanup below. A still-running application retains its
+      // candidate for resume; a desktop/terminated stream has no owner and
+      // must clear both the map and its ownership metadata here.
+      const bool is_paused = proc::proc.current_app_id() > 0;
+      if (is_paused) {
+        hdr_runtime_owner::global_manager().retain_paused();
+      }
+      else {
+        hdr_runtime_owner::clear_runtime_overrides();
+        config::mark_deferred_reload();
+      }
+
       config::set_runtime_output_name_override(std::nullopt);
 #ifdef _WIN32
       display_helper_integration::clear_pending_apply();
       clear_deferred_stream_start_actions();
 #endif
 
-      const bool is_paused = proc::proc.current_app_id() > 0;
 #ifdef _WIN32
       const bool deferred_app_revert =
         !is_paused && proc::consume_deferred_display_revert();

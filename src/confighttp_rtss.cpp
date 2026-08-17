@@ -21,6 +21,7 @@
 
   // local includes
   #include "confighttp.h"
+  #include "src/http_request_view.h"
   #include "src/config.h"
   #include "src/logging.h"
   #include "src/platform/windows/frame_limiter.h"
@@ -31,7 +32,7 @@
 namespace confighttp {
 
   using resp_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Response>;
-  using req_https_t = std::shared_ptr<typename SimpleWeb::ServerBase<SimpleWeb::HTTPS>::Request>;
+  using req_https_t = http::client_hdr::request_view;
 
   // Forward declarations for helpers defined in confighttp.cpp
   bool authenticate(resp_https_t response, req_https_t request);
@@ -232,7 +233,7 @@ namespace confighttp {
     }
     print_req(request);
 
-    auto query = request->parse_query_string();
+    auto query = http::client_hdr::parse_sanitized_query<SimpleWeb::CaseInsensitiveMultimap>(request.query);
     std::string override_path;
     if (auto it = query.find("path"); it != query.end()) {
       override_path = it->second;

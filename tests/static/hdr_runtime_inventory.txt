@@ -1,0 +1,7 @@
+# source file | classification of every rtx_hdr_peak_brightness occurrence
+src/config.cpp|config storage, validation, and runtime override persistence
+src/confighttp.cpp|validated web configuration/API key handling
+src/nvhttp.cpp|launch/resume policy resolution and candidate-map construction
+src/process.cpp|application override allowlist
+src/platform/windows/rtx_hdr_profile.cpp|manual HDR profile validation
+src/platform/windows/rtx_hdr_runtime.cpp|runtime HDR consumer

@@ -20,6 +20,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -42,6 +43,7 @@
 
 // local includes
 #include "config.h"
+#include "client_hdr_capabilities.h"
 #include "display_device.h"
 #include "display_helper_integration.h"
 #include "file_handler.h"
@@ -50,6 +52,10 @@
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "http_request_view.h"
+#include "hdr_peak_policy.h"
+#include "hdr_request_policy.h"
+#include "hdr_runtime_owner.h"
 #include "platform/common.h"
 #include "state_storage.h"
 #include "update.h"
@@ -82,12 +88,141 @@ namespace nvhttp {
   using PERM = crypto::PERM;
   using verified_client_t = std::optional<crypto::named_cert_t>;
 
+  std::string get_arg(const args_t &args, const char *name, const char *default_value);
+
   namespace {
     std::int64_t now_seconds() {
       return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch()
       )
         .count();
+    }
+
+    std::optional<client_hdr::capabilities_t> parse_client_hdr_capabilities(
+      const http::client_hdr::request_query_view &query_view
+    ) {
+      if (query_view.status != http::client_hdr::capability_status::valid ||
+          !query_view.encoded_value) {
+        return std::nullopt;
+      }
+      const auto parsed = client_hdr::parse(*query_view.encoded_value);
+      if (parsed.status != client_hdr::parse_status_e::valid || !parsed.capabilities) {
+        BOOST_LOG(debug) << "Client HDR capabilities ignored: invalid or unsupported payload."sv;
+        return std::nullopt;
+      }
+      return parsed.capabilities;
+    }
+
+    args_t args_from_query_view(const http::client_hdr::request_query_view &query_view) {
+      args_t args;
+      for (const auto &[name, value] : query_view.parameters) {
+        args.emplace(name, value);
+      }
+      return args;
+    }
+
+    std::optional<std::uint32_t> parse_peak_override(const std::string &value) {
+      if (value.empty()) return std::nullopt;
+      std::uint64_t parsed = 0;
+      for (const char ch : value) {
+        if (ch < '0' || ch > '9') return std::nullopt;
+        parsed = parsed * 10 + static_cast<std::uint64_t>(ch - '0');
+        if (parsed > client_hdr::maximum_peak_luminance_nits) return std::nullopt;
+      }
+      return static_cast<std::uint32_t>(parsed);
+    }
+
+    hdr::request_policy::override_e configured_hdr_request_override() {
+      using override_e = config::video_t::dd_t::hdr_request_override_e;
+      switch (config::video.dd.hdr_request_override) {
+        case override_e::force_on:
+          return hdr::request_policy::override_e::force_on;
+        case override_e::force_off:
+          return hdr::request_policy::override_e::force_off;
+        case override_e::automatic:
+          return hdr::request_policy::override_e::automatic;
+      }
+      return hdr::request_policy::override_e::automatic;
+    }
+
+    hdr::request_policy::override_e hdr_request_override_for_runtime_map(
+      const hdr_runtime_owner::override_map_t &runtime_overrides
+    ) {
+      if (const auto it = runtime_overrides.find("dd_hdr_request_override");
+          it != runtime_overrides.end()) {
+        if (const auto parsed = hdr::request_policy::parse_override(it->second)) {
+          return *parsed;
+        }
+      }
+      return configured_hdr_request_override();
+    }
+
+    void apply_client_peak_policy(
+      std::unordered_map<std::string, std::string> &runtime_overrides,
+      const verified_client_t &client_settings,
+      const std::optional<client_hdr::capabilities_t> &client_capabilities,
+      const bool effective_hdr,
+      rtsp_stream::launch_session_t &launch_session,
+      const std::optional<hdr_runtime_owner::override_map_t> &active_runtime_overrides = std::nullopt
+    ) {
+      if (effective_hdr && active_runtime_overrides.has_value()) {
+        const auto inherited_it = active_runtime_overrides->find("rtx_hdr_peak_brightness");
+        const auto inherited_reported = inherited_it != active_runtime_overrides->end()
+          ? parse_peak_override(inherited_it->second)
+          : std::nullopt;
+        const auto reported_peak = inherited_reported.value_or(
+          static_cast<std::uint32_t>(std::clamp(config::video.rtx_hdr.peak_brightness, 400, 2000))
+        );
+        const auto effective_peak = std::clamp<std::uint32_t>(reported_peak, 400, 2000);
+        launch_session.hdr_peak_resolution = rtsp_stream::launch_session_t::hdr_peak_resolution_t {
+          .reported_peak_nits = reported_peak,
+          .effective_peak_nits = effective_peak,
+          .source = "active-session-inherited",
+          .inherited_from_active_session = true,
+        };
+        BOOST_LOG(info) << "HDR peak: inheriting " << effective_peak
+                        << " nits from the active stream target. ";
+        return;
+      }
+
+      hdr::peak_policy::inputs_t inputs;
+      inputs.final_effective_hdr_requested = effective_hdr;
+      if (const auto it = runtime_overrides.find("rtx_hdr_peak_brightness");
+          it != runtime_overrides.end()) {
+        inputs.explicit_override_peak_nits = parse_peak_override(it->second);
+      }
+      inputs.manual_profile_selected = client_settings && !client_settings->hdr_profile.empty();
+      if (inputs.manual_profile_selected) {
+#ifdef _WIN32
+        inputs.manual_profile_peak_nits = VDISPLAY::hdr_profile_peak_luminance_nits(client_settings->hdr_profile);
+#endif
+      }
+      if (client_capabilities) {
+        inputs.client_capabilities = *client_capabilities;
+      }
+      inputs.global_default_peak_nits = static_cast<std::uint32_t>(
+        std::clamp(config::video.rtx_hdr.peak_brightness, 400, 2000)
+      );
+
+      const auto result = hdr::peak_policy::resolve(inputs);
+      if (!result.reported_peak_nits || result.source == hdr::peak_policy::source_e::global_default ||
+          result.source == hdr::peak_policy::source_e::none ||
+          result.source == hdr::peak_policy::source_e::explicit_numeric_override) {
+        return;
+      }
+
+      const auto effective_peak = std::clamp<std::uint32_t>(*result.reported_peak_nits, 400, 2000);
+      runtime_overrides.insert_or_assign("rtx_hdr_peak_brightness", std::to_string(effective_peak));
+      launch_session.hdr_peak_resolution = rtsp_stream::launch_session_t::hdr_peak_resolution_t {
+        .reported_peak_nits = *result.reported_peak_nits,
+        .effective_peak_nits = effective_peak,
+        .source = result.source == hdr::peak_policy::source_e::manual_profile ? "manual-profile" :
+                  result.source == hdr::peak_policy::source_e::client_calibrated ? "windows-icc-mhc2" :
+                  "dxgi-output",
+      };
+      BOOST_LOG(info) << "HDR peak: using " << effective_peak << " nits from "
+                      << launch_session.hdr_peak_resolution->source
+                      << (*result.reported_peak_nits == effective_peak ? "." : " (clamped to supported range).");
     }
   }  // namespace
 
@@ -104,8 +239,6 @@ namespace nvhttp {
   static std::string otp_passphrase;
   static std::string otp_device_name;
   static std::chrono::time_point<std::chrono::steady_clock> otp_creation_time;
-  thread_local crypto::x509_t tl_peer_certificate;
-
   std::string cert_subject_name_for_log(const crypto::x509_t &cert) {
     auto subject_name = crypto::subject_name(cert.get());
     if (subject_name.empty()) {
@@ -1667,20 +1800,15 @@ namespace nvhttp {
       std::string name;
     };
 
+    // The TLS callback and the route callback can run on different threads,
+    // and the same endpoint may be reused by another client.  Bind the
+    // resolved paired identity to the immutable Request object itself and
+    // consume it exactly once while constructing request_view.
     std::mutex tls_client_identity_mutex;
-    std::unordered_map<std::string, resolved_client_identity_t> tls_client_identity_by_endpoint;
+    std::unordered_map<const void *, resolved_client_identity_t> tls_client_identity_by_request;
 
-    std::string endpoint_key(req_https_t request) {
-      if (!request) {
-        return {};
-      }
-
-      const auto endpoint = request->remote_endpoint();
-      if (endpoint.address().is_unspecified() || endpoint.port() == 0) {
-        return {};
-      }
-
-      return endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
+    const void *request_identity_key(const req_https_t &request) {
+      return request.get();
     }
 
     std::optional<resolved_client_identity_t> resolve_client_identity_from_peer_cert(const crypto::x509_t &client_cert) {
@@ -1717,38 +1845,52 @@ namespace nvhttp {
     }
 
     void remember_tls_client_identity(req_https_t request, const resolved_client_identity_t &identity) {
-      const auto key = endpoint_key(request);
-      if (key.empty() || identity.uuid.empty()) {
+      const auto key = request_identity_key(request);
+      if (key == nullptr || identity.uuid.empty()) {
         return;
       }
 
       std::lock_guard<std::mutex> lock(tls_client_identity_mutex);
-      tls_client_identity_by_endpoint[key] = identity;
+      tls_client_identity_by_request[key] = identity;
     }
 
     void forget_tls_client_identity(req_https_t request) {
-      const auto key = endpoint_key(request);
-      if (key.empty()) {
+      const auto key = request_identity_key(request);
+      if (key == nullptr) {
         return;
       }
 
       std::lock_guard<std::mutex> lock(tls_client_identity_mutex);
-      tls_client_identity_by_endpoint.erase(key);
+      tls_client_identity_by_request.erase(key);
     }
 
-    std::optional<resolved_client_identity_t> get_remembered_tls_client_identity(req_https_t request) {
-      const auto key = endpoint_key(request);
-      if (key.empty()) {
+    std::optional<resolved_client_identity_t> take_tls_client_identity(req_https_t request) {
+      const auto key = request_identity_key(request);
+      if (key == nullptr) {
         return std::nullopt;
       }
 
       std::lock_guard<std::mutex> lock(tls_client_identity_mutex);
-      const auto it = tls_client_identity_by_endpoint.find(key);
-      if (it == tls_client_identity_by_endpoint.end()) {
+      const auto it = tls_client_identity_by_request.find(key);
+      if (it == tls_client_identity_by_request.end()) {
         return std::nullopt;
       }
 
-      return it->second;
+      auto identity = it->second;
+      tls_client_identity_by_request.erase(it);
+      return identity;
+    }
+
+    template <typename RequestPtr>
+    std::optional<std::string> take_tls_client_uuid(const RequestPtr &) {
+      return std::nullopt;
+    }
+
+    std::optional<std::string> take_tls_client_uuid(const req_https_t &request) {
+      if (auto identity = take_tls_client_identity(request)) {
+        return identity->uuid;
+      }
+      return std::nullopt;
     }
 
     std::mutex launch_request_mutex;
@@ -1810,14 +1952,18 @@ namespace nvhttp {
       return {};
     }
 
-    resolved_client_identity_t resolve_client_identity(req_https_t request, const verified_client_t &verified_client) {
-      if (auto remembered = get_remembered_tls_client_identity(request)) {
-        return *remembered;
-      }
-
+    resolved_client_identity_t resolve_client_identity(
+      const http::client_hdr::request_view &request,
+      const verified_client_t &verified_client
+    ) {
       resolved_client_identity_t identity;
+      if (request.tls_client_uuid) {
+        identity.uuid = *request.tls_client_uuid;
+      }
       if (verified_client) {
-        identity.uuid = verified_client->uuid;
+        if (identity.uuid.empty()) {
+          identity.uuid = verified_client->uuid;
+        }
         identity.name = verified_client->name;
       }
       return identity;
@@ -1828,7 +1974,8 @@ namespace nvhttp {
       bool input_only,
       const args_t &args,
       const verified_client_t &verified_client,
-      const resolved_client_identity_t *resolved_client_identity
+      const resolved_client_identity_t *resolved_client_identity,
+      const hdr::request_policy::override_e hdr_request_override
     ) {
       auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
@@ -2112,24 +2259,15 @@ namespace nvhttp {
       launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
       launch_session->client_vrr_requested = util::from_view(get_arg(args, "clientVrrRequested", "0"));
       launch_session->prefer_sdr_10bit = verified_client->prefer_10bit_sdr;
-#ifdef _WIN32
-      {
-        using override_e = config::video_t::dd_t::hdr_request_override_e;
-        switch (config::video.dd.hdr_request_override) {
-          case override_e::force_on:
-            launch_session->enable_hdr = true;
-            launch_session->prefer_sdr_10bit = false;
-            launch_session->force_sdr = false;
-            break;
-          case override_e::force_off:
-            launch_session->enable_hdr = false;
-            launch_session->force_sdr = true;
-            break;
-          case override_e::automatic:
-            break;
-        }
-      }
-#endif
+      const auto hdr_request = hdr::request_policy::resolve({
+        .client_hdr_requested = launch_session->enable_hdr,
+        .prefer_sdr_10bit = launch_session->prefer_sdr_10bit,
+        .force_sdr = launch_session->force_sdr,
+        .request_override = hdr_request_override,
+      });
+      launch_session->enable_hdr = hdr_request.enable_hdr;
+      launch_session->prefer_sdr_10bit = hdr_request.prefer_sdr_10bit;
+      launch_session->force_sdr = hdr_request.force_sdr;
       if (const auto virtual_display_arg = args.find("virtualDisplay"); virtual_display_arg != std::end(args)) {
         launch_session->client_virtual_display_override = util::from_view(virtual_display_arg->second) != 0;
         if (!*launch_session->client_virtual_display_override) {
@@ -2208,7 +2346,14 @@ namespace nvhttp {
       if (named_cert_p) {
         verified_client = *named_cert_p;
       }
-      return make_launch_session_from_snapshot(host_audio, input_only, args, verified_client, resolved_client_identity);
+      return make_launch_session_from_snapshot(
+        host_audio,
+        input_only,
+        args,
+        verified_client,
+        resolved_client_identity,
+        configured_hdr_request_override()
+      );
     }
 
     void remove_session(const pair_session_t &sess) {
@@ -2428,29 +2573,15 @@ namespace nvhttp {
       static auto constexpr to_string = "NONE"sv;
     };
 
-    inline verified_client_t get_verified_cert(req_https_t request) {
-      if (auto remembered = get_remembered_tls_client_identity(request)) {
+    inline verified_client_t get_verified_cert(
+      const http::client_hdr::request_view &request
+    ) {
+      if (request.tls_client_uuid) {
         std::lock_guard<std::mutex> lock(client_mutex);
         for (const auto &named_cert_p : client_root.named_devices) {
-          if (named_cert_p && named_cert_p->uuid == remembered->uuid) {
+          if (named_cert_p && named_cert_p->uuid == *request.tls_client_uuid) {
             return *named_cert_p;
           }
-        }
-      }
-
-      if (!tl_peer_certificate) {
-        return std::nullopt;
-      }
-
-      const auto peer_signature = crypto::signature(tl_peer_certificate.get());
-      std::lock_guard<std::mutex> lock(client_mutex);
-      for (const auto &named_cert_p : client_root.named_devices) {
-        if (!named_cert_p) {
-          continue;
-        }
-        auto stored_x509 = crypto::x509(named_cert_p->cert);
-        if (stored_x509 && crypto::signature(stored_x509.get()) == peer_signature) {
-          return *named_cert_p;
         }
       }
       return std::nullopt;
@@ -2493,28 +2624,33 @@ namespace nvhttp {
     }
 
     template<class T>
-    void print_req(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
-      BOOST_LOG(verbose) << "HTTP "sv << request->method << ' ' << request->path << " tunnel="sv << tunnel<T>::to_string;
+    void print_req(const http::client_hdr::request_view &request) {
+      BOOST_LOG(verbose) << "HTTP "sv << request.method << ' ' << request.path << " tunnel="sv << tunnel<T>::to_string;
 
-      if (!request->header.empty()) {
+      if (!request.header.empty()) {
         BOOST_LOG(verbose) << "Headers:"sv;
-        for (auto &[name, val] : request->header) {
+        for (const auto &[name, val] : request.header) {
           BOOST_LOG(verbose) << name << " -- " << val;
         }
       }
 
-      auto query = request->parse_query_string();
-      if (!query.empty()) {
-        BOOST_LOG(verbose) << "Query Params:"sv;
-        for (auto &[name, val] : query) {
-          BOOST_LOG(verbose) << name << " -- " << val;
-        }
+      const auto &query_view = request.query;
+      if (!query_view.sanitized_query.empty()) {
+        BOOST_LOG(verbose) << "Query Params: "sv << query_view.sanitized_query;
+      }
+      if (query_view.status == http::client_hdr::capability_status::valid) {
+        BOOST_LOG(verbose) << "Client HDR capabilities: present"sv;
+      } else if (query_view.status == http::client_hdr::capability_status::invalid) {
+        BOOST_LOG(verbose) << "Client HDR capabilities: invalid"sv;
       }
     }
 
 
     template<class T>
-    void not_found(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+    void not_found(
+      std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response,
+      const http::client_hdr::request_view &request
+    ) {
       print_req<T>(request);
 
       pt::ptree tree;
@@ -2529,7 +2665,10 @@ namespace nvhttp {
     }
 
     template<class T>
-    void unpair(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+    void unpair(
+      std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response,
+      const http::client_hdr::request_view &request
+    ) {
       print_req<T>(request);
 
       pt::ptree tree;
@@ -2542,7 +2681,7 @@ namespace nvhttp {
         response->close_connection_after_response = true;
       });
 
-      auto args = request->parse_query_string();
+      auto args = args_from_query_view(request.query);
       auto unique_id = get_arg(args, "uniqueid", "");
 
       const bool cleaned_pending_pair = !unique_id.empty() && map_id_sess.erase(unique_id) > 0;
@@ -2563,7 +2702,10 @@ namespace nvhttp {
     }
 
     template<class T>
-    void pair(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+    void pair(
+      std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response,
+      const http::client_hdr::request_view &request
+    ) {
       print_req<T>(request);
 
       pt::ptree tree;
@@ -2583,7 +2725,7 @@ namespace nvhttp {
         return;
       }
 
-      auto args = request->parse_query_string();
+      auto args = args_from_query_view(request.query);
       if (args.find("uniqueid"s) == std::end(args)) {
         tree.put("root.<xmlattr>.status_code", 400);
         tree.put("root.<xmlattr>.status_message", "Missing uniqueid parameter");
@@ -2778,12 +2920,15 @@ namespace nvhttp {
     }
 
     template<class T>
-    void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+    void serverinfo(
+      std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response,
+      const http::client_hdr::request_view &request
+    ) {
       print_req<T>(request);
 
       int pair_status = 0;
       if constexpr (std::is_same_v<SunshineHTTPS, T>) {
-        auto args = request->parse_query_string();
+        auto args = args_from_query_view(request.query);
         auto clientID = args.find("uniqueid"s);
 
         if (clientID != std::end(args)) {
@@ -2791,7 +2936,7 @@ namespace nvhttp {
         }
       }
 
-      auto local_endpoint = request->local_endpoint();
+      auto local_endpoint = request.local_endpoint;
 
       pt::ptree tree;
 
@@ -2800,6 +2945,10 @@ namespace nvhttp {
 
       tree.put("root.appversion", VERSION);
       tree.put("root.GfeVersion", GFE_VERSION);
+      // Vibepollo understands the v1 normalized Windows Desktop client HDR
+      // capability payload. This is a protocol version advertisement only;
+      // the client sends nothing unless this exact value is present.
+      tree.put("root.ClientDisplayCapabilitiesVersion", 1);
       tree.put("root.uniqueid", http::unique_id);
       tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
       tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
@@ -3038,7 +3187,7 @@ namespace nvhttp {
       }
     }
 
-    void applist(resp_https_t response, req_https_t request) {
+    void applist(resp_https_t response, const http::client_hdr::request_view &request) {
       print_req<SunshineHTTPS>(request);
 
       pt::ptree tree;
@@ -3141,7 +3290,7 @@ namespace nvhttp {
       }
     }
 
-    void launch(bool &host_audio, resp_https_t response, req_https_t request, int current_appid) {
+    void launch(bool &host_audio, resp_https_t response, const http::client_hdr::request_view &request, int current_appid) {
       print_req<SunshineHTTPS>(request);
 
 #ifdef _WIN32
@@ -3163,7 +3312,9 @@ namespace nvhttp {
         }
       });
 
-      auto args = request->parse_query_string();
+      const auto &query_view = request.query;
+      auto args = args_from_query_view(query_view);
+      const auto client_hdr_capabilities = parse_client_hdr_capabilities(query_view);
 
       auto appid_str = get_arg(args, "appid", "0");
       auto appuuid_str = get_arg(args, "appuuid", "");
@@ -3177,7 +3328,7 @@ namespace nvhttp {
       auto required_perm = PERM::launch;
 
       BOOST_LOG(verbose) << "Launching app [" << appid_str << "] with UUID [" << appuuid_str << "]";
-      // BOOST_LOG(verbose) << "QS: " << request->query_string;
+      // The raw query is intentionally unavailable at this boundary.
 
       // If we have already launched an app, we should allow clients with view permission to join the input only or current app's session.
       if (
@@ -3290,14 +3441,24 @@ namespace nvhttp {
 
       // Apply per-application runtime config overrides before we build session metadata or
       // prepare display/capture so the effective config is used everywhere.
-      bool runtime_overrides_applied = false;
       bool keep_runtime_overrides = false;
+      const std::optional<hdr_runtime_owner::override_map_t> active_runtime_overrides =
+        update_runtime_overrides ? std::nullopt :
+        std::optional<hdr_runtime_owner::override_map_t>(hdr_runtime_owner::runtime_overrides_snapshot());
+      const auto runtime_prior_overrides = hdr_runtime_owner::runtime_overrides_snapshot();
+      std::optional<hdr_runtime_owner::lease_token_t> runtime_owner_token;
       auto runtime_overrides_guard = util::fail_guard([&]() {
-        if (!runtime_overrides_applied || keep_runtime_overrides) {
+        if (keep_runtime_overrides || !runtime_owner_token) {
           return;
         }
 
-        config::clear_runtime_config_overrides();
+        const auto rollback = hdr_runtime_owner::global_manager().cancel(
+          *runtime_owner_token,
+          hdr_runtime_owner::runtime_overrides_snapshot()
+        );
+        if (rollback.replacement_map) {
+          hdr_runtime_owner::publish_rollback_runtime_overrides(*rollback.replacement_map);
+        }
 
         // Restore global config immediately when safe; otherwise defer.
         if (!has_stream_session_activity()) {
@@ -3308,39 +3469,44 @@ namespace nvhttp {
       });
 
       if (update_runtime_overrides) {
-        try {
-          auto overrides = requested_runtime_overrides;
+        auto overrides = requested_runtime_overrides;
 
 #ifdef _WIN32
-          // "Auto" client peak brightness follows the selected Windows HDR calibration
-          // profile's MHC2 peak. An explicit app/client override remains authoritative.
-          if (client_settings &&
-              !client_settings->hdr_profile.empty() &&
-              !overrides.contains("rtx_hdr_peak_brightness")) {
-            if (const auto profile_peak = VDISPLAY::hdr_profile_peak_luminance_nits(client_settings->hdr_profile)) {
-              const auto effective_peak = std::clamp<std::uint32_t>(*profile_peak, 400, 2000);
-              overrides.insert_or_assign("rtx_hdr_peak_brightness", std::to_string(effective_peak));
-              BOOST_LOG(info) << "HDR peak: using " << effective_peak << " nits from MHC2 profile '"
-                              << client_settings->hdr_profile << "'"
-                              << (*profile_peak == effective_peak ? "." : " (clamped to supported range).");
-            } else {
-              BOOST_LOG(warning) << "HDR peak: profile '" << client_settings->hdr_profile
-                                 << "' has no readable MHC2 peak; using the configured default.";
-            }
+        // "Auto" client peak brightness follows the selected Windows HDR calibration
+        // profile's MHC2 peak. An explicit app/client override remains authoritative.
+        if (client_settings &&
+            !client_settings->hdr_profile.empty() &&
+            !overrides.contains("rtx_hdr_peak_brightness")) {
+          if (const auto profile_peak = VDISPLAY::hdr_profile_peak_luminance_nits(client_settings->hdr_profile)) {
+            const auto effective_peak = std::clamp<std::uint32_t>(*profile_peak, 400, 2000);
+            overrides.insert_or_assign("rtx_hdr_peak_brightness", std::to_string(effective_peak));
+            BOOST_LOG(info) << "HDR peak: using " << effective_peak << " nits from MHC2 profile '"
+                            << client_settings->hdr_profile << "'"
+                            << (*profile_peak == effective_peak ? "." : " (clamped to supported range).");
+          } else {
+            BOOST_LOG(warning) << "HDR peak: profile '" << client_settings->hdr_profile
+                               << "' has no readable MHC2 peak; using the configured default.";
           }
+        }
 #endif
 
-          config::set_runtime_config_overrides(std::move(overrides));
-          runtime_overrides_applied = true;
-
-          // Re-apply config so overrides take effect in config::video/config::input/etc.
-          config::apply_config_now();
-        } catch (...) {
-          // If something goes wrong, fall back to global config only.
-          config::clear_runtime_config_overrides();
-          config::apply_config_now();
-          runtime_overrides_applied = true;
+        const auto transaction = hdr_runtime_owner::global_manager().begin_candidate(runtime_prior_overrides);
+        const auto lease = hdr_runtime_owner::global_manager().apply_candidate(
+          transaction,
+          overrides
+        );
+        if (!lease) {
+          throw std::runtime_error("Unable to reserve HDR runtime configuration");
         }
+        runtime_owner_token = lease->token;
+        if (!hdr_runtime_owner::publish_candidate_runtime_overrides(
+              *runtime_owner_token,
+              overrides
+            )) {
+          throw std::runtime_error("HDR runtime candidate became stale before publication");
+        }
+        // Re-apply config so overrides take effect in config::video/config::input/etc.
+        config::apply_config_now();
       } else {
         BOOST_LOG(debug) << "Launch while an RTSP/WebRTC session is already active; preserving current runtime overrides.";
       }
@@ -3365,7 +3531,54 @@ namespace nvhttp {
       );
 #endif
       const bool allow_display_changes = true;
-      auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity);
+      const auto prospective_runtime_overrides = hdr_runtime_owner::runtime_overrides_snapshot();
+      auto launch_session = make_launch_session_from_snapshot(
+        host_audio,
+        is_input_only,
+        args,
+        verified_client,
+        &request_client_identity,
+        hdr_request_override_for_runtime_map(prospective_runtime_overrides)
+      );
+      launch_session->client_hdr_capabilities = client_hdr_capabilities;
+      const auto runtime_overrides_before_hdr_policy = requested_runtime_overrides;
+      apply_client_peak_policy(
+        requested_runtime_overrides,
+        client_settings,
+        client_hdr_capabilities,
+        rtsp_stream::effective_hdr_requested(*launch_session),
+        *launch_session,
+        active_runtime_overrides
+      );
+      if (update_runtime_overrides && requested_runtime_overrides != runtime_overrides_before_hdr_policy) {
+        if (!runtime_owner_token ||
+            !hdr_runtime_owner::global_manager().update_candidate(
+              *runtime_owner_token,
+              requested_runtime_overrides
+            ) ||
+            !hdr_runtime_owner::publish_candidate_runtime_overrides(
+              *runtime_owner_token,
+              requested_runtime_overrides
+            )) {
+          throw std::runtime_error("HDR runtime candidate became stale during peak policy resolution");
+        }
+        config::apply_config_now();
+      }
+      if (runtime_owner_token) {
+        launch_session->hdr_runtime_generation = runtime_owner_token->generation;
+        launch_session->hdr_runtime_owner_token = runtime_owner_token->participant;
+      }
+      if (!runtime_owner_token) {
+        if (const auto owner_state = hdr_runtime_owner::global_manager().state();
+            owner_state && owner_state->phase == hdr_runtime_owner::phase_e::awaiting_stream &&
+            owner_state->owner_token) {
+          if (const auto participant = hdr_runtime_owner::global_manager().add_participant(*owner_state->owner_token)) {
+            runtime_owner_token = *participant;
+            launch_session->hdr_runtime_generation = participant->generation;
+            launch_session->hdr_runtime_owner_token = participant->participant;
+          }
+        }
+      }
       std::optional<std::string> pending_output_override;
       auto output_override_guard = util::fail_guard([&]() {
         if (pending_output_override) {
@@ -3632,25 +3845,23 @@ namespace nvhttp {
         std::format(
           "{}{}:{}",
           launch_session->rtsp_url_scheme,
-          net::addr_to_url_escaped_string(request->local_endpoint().address()),
+          net::addr_to_url_escaped_string(request.local_endpoint.address()),
           static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
         )
       );
-      keep_runtime_overrides = true;
       tree.put("root.gamesession", 1);
 #ifdef _WIN32
       tree.put("root.VirtualDisplayDriverReady", proc::vDisplayDriverStatus.load(std::memory_order_acquire) == VDISPLAY::DRIVER_STATUS::OK);
 #else
       tree.put("root.VirtualDisplayDriverReady", false);
 #endif
-#ifdef _WIN32
-      pending_vulkan_hdr_layer_guard.disable();
-#endif
-
       stream::session::arm_shared_runtime_cleanup(
         launch_session->virtual_display_guid_bytes
       );
       rtsp_stream::launch_session_raise(launch_session);
+#ifdef _WIN32
+      pending_vulkan_hdr_layer_guard.disable();
+#endif
 #ifdef _WIN32
       virtual_display_teardown_guard.disable();
 #endif
@@ -3660,7 +3871,7 @@ namespace nvhttp {
     }
 
 
-  void resume(bool &host_audio, resp_https_t response, req_https_t request, int current_appid) {
+  void resume(bool &host_audio, resp_https_t response, const http::client_hdr::request_view &request, int current_appid) {
     print_req<SunshineHTTPS>(request);
 
 #ifdef _WIN32
@@ -3709,7 +3920,9 @@ namespace nvhttp {
       return;
     }
 
-    auto args = request->parse_query_string();
+    const auto &query_view = request.query;
+    auto args = args_from_query_view(query_view);
+    const auto client_hdr_capabilities = parse_client_hdr_capabilities(query_view);
     if (
       args.find("rikey"s) == std::end(args) ||
       args.find("rikeyid"s) == std::end(args)
@@ -3777,13 +3990,19 @@ namespace nvhttp {
       return;
     }
 
-    bool runtime_overrides_reapplied = false;
-    auto previous_runtime_overrides = config::runtime_config_overrides_snapshot();
+    auto previous_runtime_overrides = hdr_runtime_owner::runtime_overrides_snapshot();
+    std::optional<hdr_runtime_owner::lease_token_t> runtime_owner_token;
     auto runtime_overrides_guard = util::fail_guard([&]() {
-      if (!runtime_overrides_reapplied) {
+      if (!runtime_owner_token) {
         return;
       }
-      config::set_runtime_config_overrides(std::move(previous_runtime_overrides));
+      const auto rollback = hdr_runtime_owner::global_manager().cancel(
+        *runtime_owner_token,
+        hdr_runtime_owner::runtime_overrides_snapshot()
+      );
+      if (rollback.replacement_map) {
+        hdr_runtime_owner::publish_rollback_runtime_overrides(*rollback.replacement_map);
+      }
       if (!has_stream_session_activity()) {
         config::apply_config_now();
       } else {
@@ -3792,9 +4011,22 @@ namespace nvhttp {
     });
 
     if (no_active_sessions) {
-      config::set_runtime_config_overrides(std::move(requested_runtime_overrides));
+      const auto transaction = hdr_runtime_owner::global_manager().begin_candidate(previous_runtime_overrides);
+      const auto lease = hdr_runtime_owner::global_manager().apply_candidate(
+        transaction,
+        requested_runtime_overrides
+      );
+      if (!lease) {
+        throw std::runtime_error("Unable to reserve HDR runtime resume configuration");
+      }
+      runtime_owner_token = lease->token;
+      if (!hdr_runtime_owner::publish_candidate_runtime_overrides(
+            *runtime_owner_token,
+            requested_runtime_overrides
+          )) {
+        throw std::runtime_error("HDR runtime resume candidate became stale before publication");
+      }
       config::apply_config_now();
-      runtime_overrides_reapplied = true;
     }
 
     const bool is_input_only = config::input.enable_input_only_mode && current_appid == proc::input_only_app_id;
@@ -3816,7 +4048,55 @@ namespace nvhttp {
       config::record_active_adapter_config();
     }
 
-    auto launch_session = make_launch_session_from_snapshot(host_audio, is_input_only, args, verified_client, &request_client_identity);
+    const auto prospective_runtime_overrides = hdr_runtime_owner::runtime_overrides_snapshot();
+    auto launch_session = make_launch_session_from_snapshot(
+      host_audio,
+      is_input_only,
+      args,
+      verified_client,
+      &request_client_identity,
+      hdr_request_override_for_runtime_map(prospective_runtime_overrides)
+    );
+    launch_session->client_hdr_capabilities = client_hdr_capabilities;
+    const auto runtime_overrides_before_hdr_policy = requested_runtime_overrides;
+    apply_client_peak_policy(
+      requested_runtime_overrides,
+      client_settings,
+      client_hdr_capabilities,
+      rtsp_stream::effective_hdr_requested(*launch_session),
+      *launch_session,
+      no_active_sessions ? std::nullopt :
+        std::optional<hdr_runtime_owner::override_map_t>(hdr_runtime_owner::runtime_overrides_snapshot())
+    );
+    if (no_active_sessions && requested_runtime_overrides != runtime_overrides_before_hdr_policy) {
+      if (!runtime_owner_token ||
+          !hdr_runtime_owner::global_manager().update_candidate(
+            *runtime_owner_token,
+            requested_runtime_overrides
+          ) ||
+          !hdr_runtime_owner::publish_candidate_runtime_overrides(
+            *runtime_owner_token,
+            requested_runtime_overrides
+          )) {
+        throw std::runtime_error("HDR runtime resume candidate became stale during peak policy resolution");
+      }
+      config::apply_config_now();
+    }
+    if (runtime_owner_token) {
+      launch_session->hdr_runtime_generation = runtime_owner_token->generation;
+      launch_session->hdr_runtime_owner_token = runtime_owner_token->participant;
+    }
+    if (!runtime_owner_token) {
+      if (const auto owner_state = hdr_runtime_owner::global_manager().state();
+          owner_state && owner_state->phase == hdr_runtime_owner::phase_e::awaiting_stream &&
+          owner_state->owner_token) {
+        if (const auto participant = hdr_runtime_owner::global_manager().add_participant(*owner_state->owner_token)) {
+          runtime_owner_token = *participant;
+          launch_session->hdr_runtime_generation = participant->generation;
+          launch_session->hdr_runtime_owner_token = participant->participant;
+        }
+      }
+    }
     if (!proc::proc.allow_client_commands || !verified_client->allow_client_commands) {
       launch_session->client_do_cmds.clear();
       launch_session->client_undo_cmds.clear();
@@ -4072,7 +4352,7 @@ namespace nvhttp {
       }
     }
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    auto encryption_mode = net::encryption_mode_for_address(request.remote_endpoint.address());
     if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
@@ -4089,7 +4369,7 @@ namespace nvhttp {
       std::format(
         "{}{}:{}",
         launch_session->rtsp_url_scheme,
-        net::addr_to_url_escaped_string(request->local_endpoint().address()),
+        net::addr_to_url_escaped_string(request.local_endpoint.address()),
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
@@ -4118,7 +4398,7 @@ namespace nvhttp {
 #endif
   }
 
-  void cancel(resp_https_t response, req_https_t request) {
+  void cancel(resp_https_t response, const http::client_hdr::request_view &request) {
     print_req<SunshineHTTPS>(request);
 
 #ifdef _WIN32
@@ -4178,7 +4458,7 @@ namespace nvhttp {
 #endif
   }
 
-  void appasset(resp_https_t response, req_https_t request) {
+  void appasset(resp_https_t response, const http::client_hdr::request_view &request) {
     print_req<SunshineHTTPS>(request);
 
     auto fg = util::fail_guard([&]() {
@@ -4197,7 +4477,7 @@ namespace nvhttp {
       return;
     }
 
-    auto args = request->parse_query_string();
+      auto args = args_from_query_view(request.query);
     const auto appid = get_arg(args, "appid", "0");
     const auto appuuid = get_arg(args, "appuuid", "");
     auto app_ctx = proc::proc.resolve_app(appid, appuuid);
@@ -4212,7 +4492,7 @@ namespace nvhttp {
     response->close_connection_after_response = true;
   }
 
-  void getClipboard(resp_https_t response, req_https_t request) {
+  void getClipboard(resp_https_t response, const http::client_hdr::request_view &request) {
     print_req<SunshineHTTPS>(request);
 
     auto verified_client = get_verified_cert(request);
@@ -4227,7 +4507,7 @@ namespace nvhttp {
       return;
     }
 
-    auto args = request->parse_query_string();
+      auto args = args_from_query_view(request.query);
     auto clipboard_type = get_arg(args, "type");
     if (clipboard_type != "text"sv) {
       BOOST_LOG(debug) << "Clipboard type [" << clipboard_type << "] is not supported!";
@@ -4258,7 +4538,7 @@ namespace nvhttp {
     return;
   }
 
-  void setClipboard(resp_https_t response, req_https_t request) {
+  void setClipboard(resp_https_t response, const http::client_hdr::request_view &request) {
     print_req<SunshineHTTPS>(request);
 
     auto verified_client = get_verified_cert(request);
@@ -4273,7 +4553,7 @@ namespace nvhttp {
       return;
     }
 
-    auto args = request->parse_query_string();
+      auto args = args_from_query_view(request.query);
     auto clipboard_type = get_arg(args, "type");
     if (clipboard_type != "text"sv) {
       BOOST_LOG(debug) << "Clipboard type [" << clipboard_type << "] is not supported!";
@@ -4299,7 +4579,7 @@ namespace nvhttp {
       return;
     }
 
-    std::string content = request->content.string();
+    std::string content = request.body;
 
     bool success = platf::set_clipboard(content);
 
@@ -4314,7 +4594,7 @@ namespace nvhttp {
     return;
   }
 
-  void setBitrate(resp_https_t response, req_https_t request) {
+  void setBitrate(resp_https_t response, const http::client_hdr::request_view &request) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -4334,7 +4614,7 @@ namespace nvhttp {
       return;
     }
 
-    auto args = request->parse_query_string();
+      auto args = args_from_query_view(request.query);
     const int requested = (int) util::from_view(get_arg(args, "bitrate", "0"));
     if (requested <= 0) {
       tree.put("root.bitrate", 0);
@@ -4372,7 +4652,7 @@ namespace nvhttp {
     tree.put("root.<xmlattr>.status_code", 200);
   }
 
-  void getAbrCapabilities(resp_https_t response, req_https_t request) {
+  void getAbrCapabilities(resp_https_t response, const http::client_hdr::request_view &request) {
     print_req<SunshineHTTPS>(request);
 
     auto verified_client = get_verified_cert(request);
@@ -4432,7 +4712,6 @@ namespace nvhttp {
 
     // Verify certificates after establishing connection
     https_server.verify = [](req_https_t req, SSL *ssl) {
-      tl_peer_certificate.reset();
       forget_tls_client_identity(req);
 
       crypto::x509_t x509_verify {
@@ -4500,13 +4779,17 @@ namespace nvhttp {
         if (auto identity = resolve_client_identity_from_peer_cert(x509_verify)) {
           remember_tls_client_identity(req, *identity);
         }
-        tl_peer_certificate = std::move(x509_verify);
       }
 
       return true;
     };
 
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
+      const auto request = http::client_hdr::make_request_view(
+        req,
+        true,
+        take_tls_client_uuid(req)
+      );
       pt::ptree tree;
       auto g = util::fail_guard([&]() {
         std::ostringstream data;
@@ -4517,7 +4800,7 @@ namespace nvhttp {
       });
 
       tree.put("root.<xmlattr>.status_code"s, 401);
-      tree.put("root.<xmlattr>.query"s, req->path);
+      tree.put("root.<xmlattr>.query"s, request.path);
       tree.put("root.<xmlattr>.status_message"s, "The client is not authorized. Certificate verification failed."s);
     };
 
@@ -4541,67 +4824,84 @@ namespace nvhttp {
       run_on_blocking_pool(discovery_route_pool, std::move(task));
     };
 
-    https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
-    https_server.default_resource["POST"] = not_found<SunshineHTTPS>;
-    https_server.resource["^/serverinfo$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
-      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
-        serverinfo<SunshineHTTPS>(std::move(resp), std::move(req));
+    auto make_route_request_view = [](const auto &request, const bool tls) {
+      return http::client_hdr::make_request_view(
+        request,
+        tls,
+        take_tls_client_uuid(request)
+      );
+    };
+
+    auto adapt_request = [make_route_request_view](auto handler, const bool tls) {
+      return [handler = std::move(handler), tls, make_route_request_view](auto response, auto request) mutable {
+        handler(
+          std::move(response),
+          make_route_request_view(request, tls)
+        );
+      };
+    };
+
+    https_server.default_resource["GET"] = adapt_request(not_found<SunshineHTTPS>, true);
+    https_server.default_resource["POST"] = adapt_request(not_found<SunshineHTTPS>, true);
+    https_server.resource["^/serverinfo$"]["GET"] = [run_discovery_nvhttp, make_route_request_view](auto resp, auto req) {
+      run_discovery_nvhttp([resp = std::move(resp), request = make_route_request_view(req, true)]() mutable {
+        serverinfo<SunshineHTTPS>(std::move(resp), request);
       });
     };
-    https_server.resource["^/pair/?$"]["GET"] = pair<SunshineHTTPS>;
-    https_server.resource["^/pair/?$"]["POST"] = pair<SunshineHTTPS>;
-    https_server.resource["^/unpair/?$"]["GET"] = unpair<SunshineHTTPS>;
-    https_server.resource["^/unpair/?$"]["POST"] = unpair<SunshineHTTPS>;
-    https_server.resource["^/applist$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
-      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
-        applist(std::move(resp), std::move(req));
+    https_server.resource["^/pair/?$"]["GET"] = adapt_request(pair<SunshineHTTPS>, true);
+    https_server.resource["^/pair/?$"]["POST"] = adapt_request(pair<SunshineHTTPS>, true);
+    https_server.resource["^/unpair/?$"]["GET"] = adapt_request(unpair<SunshineHTTPS>, true);
+    https_server.resource["^/unpair/?$"]["POST"] = adapt_request(unpair<SunshineHTTPS>, true);
+    https_server.resource["^/applist$"]["GET"] = [run_discovery_nvhttp, make_route_request_view](auto resp, auto req) {
+      run_discovery_nvhttp([resp = std::move(resp), request = make_route_request_view(req, true)]() mutable {
+        applist(std::move(resp), request);
       });
     };
-    https_server.resource["^/appasset$"]["GET"] = appasset;
-    https_server.resource["^/launch$"]["GET"] = [&host_audio, run_blocking_nvhttp](auto resp, auto req) {
-      run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
+    https_server.resource["^/appasset$"]["GET"] = adapt_request(appasset, true);
+    https_server.resource["^/launch$"]["GET"] = [&host_audio, run_blocking_nvhttp, make_route_request_view](auto resp, auto req) {
+      run_blocking_nvhttp([&host_audio, resp = std::move(resp), request = make_route_request_view(req, true)]() mutable {
         std::lock_guard launch_lock {launch_request_mutex};
         (void) proc::proc.running();
         std::lock_guard lifecycle_lock {stream_lifecycle_gate};
         const int current_appid = proc::proc.current_app_id();
-        launch(host_audio, std::move(resp), std::move(req), current_appid);
+        launch(host_audio, std::move(resp), request, current_appid);
       });
     };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio, run_blocking_nvhttp](auto resp, auto req) {
-      run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
+    https_server.resource["^/resume$"]["GET"] = [&host_audio, run_blocking_nvhttp, make_route_request_view](auto resp, auto req) {
+      run_blocking_nvhttp([&host_audio, resp = std::move(resp), request = make_route_request_view(req, true)]() mutable {
         std::lock_guard launch_lock {launch_request_mutex};
         (void) proc::proc.running();
         std::lock_guard lifecycle_lock {stream_lifecycle_gate};
         const int current_appid = proc::proc.current_app_id();
-        resume(host_audio, std::move(resp), std::move(req), current_appid);
+        resume(host_audio, std::move(resp), request, current_appid);
       });
     };
-    https_server.resource["^/cancel$"]["GET"] = [run_blocking_nvhttp](auto resp, auto req) {
-      run_blocking_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
+    https_server.resource["^/cancel$"]["GET"] = [run_blocking_nvhttp, make_route_request_view](auto resp, auto req) {
+      run_blocking_nvhttp([resp = std::move(resp), request = make_route_request_view(req, true)]() mutable {
         std::lock_guard lock {launch_request_mutex};
-        cancel(std::move(resp), std::move(req));
+        cancel(std::move(resp), request);
       });
     };
-    https_server.resource["^/actions/clipboard$"]["GET"] = getClipboard;
-    https_server.resource["^/actions/clipboard$"]["POST"] = setClipboard;
-    https_server.resource["^/bitrate$"]["GET"] = setBitrate;
-    https_server.resource["^/api/abr/capabilities$"]["GET"] = getAbrCapabilities;
+    https_server.resource["^/actions/clipboard$"]["GET"] = adapt_request(getClipboard, true);
+    https_server.resource["^/actions/clipboard$"]["POST"] = adapt_request(setClipboard, true);
+    https_server.resource["^/bitrate$"]["GET"] = adapt_request(setBitrate, true);
+    https_server.resource["^/api/abr/capabilities$"]["GET"] = adapt_request(getAbrCapabilities, true);
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
     https_server.config.port = port_https;
 
-    http_server.default_resource["GET"] = not_found<SimpleWeb::HTTP>;
-    http_server.default_resource["POST"] = not_found<SimpleWeb::HTTP>;
-    http_server.resource["^/serverinfo$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
-      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
-        serverinfo<SimpleWeb::HTTP>(std::move(resp), std::move(req));
+    http_server.default_resource["GET"] = adapt_request(not_found<SimpleWeb::HTTP>, false);
+    http_server.default_resource["POST"] = adapt_request(not_found<SimpleWeb::HTTP>, false);
+    http_server.resource["^/serverinfo$"]["GET"] = [run_discovery_nvhttp, make_route_request_view](auto resp, auto req) {
+      run_discovery_nvhttp([resp = std::move(resp), request = make_route_request_view(req, false)]() mutable {
+        serverinfo<SimpleWeb::HTTP>(std::move(resp), request);
       });
     };
-    http_server.resource["^/pair/?$"]["GET"] = pair<SimpleWeb::HTTP>;
-    http_server.resource["^/pair/?$"]["POST"] = pair<SimpleWeb::HTTP>;
-    http_server.resource["^/unpair/?$"]["GET"] = unpair<SimpleWeb::HTTP>;
-    http_server.resource["^/unpair/?$"]["POST"] = unpair<SimpleWeb::HTTP>;
+    http_server.resource["^/pair/?$"]["GET"] = adapt_request(pair<SimpleWeb::HTTP>, false);
+    http_server.resource["^/pair/?$"]["POST"] = adapt_request(pair<SimpleWeb::HTTP>, false);
+    http_server.resource["^/unpair/?$"]["GET"] = adapt_request(unpair<SimpleWeb::HTTP>, false);
+    http_server.resource["^/unpair/?$"]["POST"] = adapt_request(unpair<SimpleWeb::HTTP>, false);
 
     http_server.config.reuse_address = true;
     http_server.config.address = net::get_bind_address(address_family);

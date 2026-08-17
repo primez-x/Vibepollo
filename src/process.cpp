@@ -67,6 +67,7 @@
   #include <Psapi.h>
 #endif
 #include "httpcommon.h"
+#include "hdr_runtime_owner.h"
 #include "nvhttp.h"
 #include "process.h"
 #ifdef _WIN32
@@ -940,6 +941,7 @@ namespace proc {
       _app(std::move(other._app)),
       _app_launch_time(other._app_launch_time),
       _active_client_uuid(std::move(other._active_client_uuid)),
+      _app_state_revision(other._app_state_revision),
       placebo(other.placebo),
       _process(std::move(other._process)),
       _process_group(std::move(other._process_group)),
@@ -978,6 +980,7 @@ namespace proc {
       _app = std::move(other._app);
       _app_launch_time = other._app_launch_time;
       _active_client_uuid = std::move(other._active_client_uuid);
+      _app_state_revision = other._app_state_revision;
       placebo = other.placebo;
       _process = std::move(other._process);
       _process_group = std::move(other._process_group);
@@ -1235,10 +1238,14 @@ namespace proc {
   }
 
   void proc_t::launch_input_only() {
-    _app_id = input_only_app_id;
+    {
+      std::scoped_lock lock(_apps_mutex);
+      _app_id = input_only_app_id;
+      _app.uuid = REMOTE_INPUT_UUID;
+      _app.terminate_on_pause = true;
+      ++_app_state_revision;
+    }
     _app_name = "Remote Input";
-    _app.uuid = REMOTE_INPUT_UUID;
-    _app.terminate_on_pause = true;
     allow_client_commands = false;
     placebo = true;
 
@@ -1265,8 +1272,14 @@ namespace proc {
       terminate(false, false, skip_display_revert, true);
     }
 
-    _app = app;
-    _app_id = util::from_view(app.id);
+    {
+      // stream_lifecycle_mutex() is held by the launch path before this
+      // method, so this remains gate -> app-lock ordering.
+      std::scoped_lock lock(_apps_mutex);
+      _app = app;
+      _app_id = util::from_view(app.id);
+      ++_app_state_revision;
+    }
 #ifdef _WIN32
     // A replacement app owns the streaming display configuration. Any
     // restore deferred by the previous app must not fire at this session's end.
@@ -2693,11 +2706,15 @@ namespace proc {
       BOOST_LOG(info) << "Deferring display revert after app termination because another streaming session is still active.";
     }
 
-    _active_client_uuid.clear();
-    _app_launch_time = {};
-    _app_id = -1;
+    {
+      std::scoped_lock lock(_apps_mutex);
+      _active_client_uuid.clear();
+      _app_launch_time = {};
+      _app_id = -1;
+      _app = {};
+      ++_app_state_revision;
+    }
     _app_name.clear();
-    _app = {};
     display_name.clear();
     initial_display.clear();
     _launch_session.reset();
@@ -2716,7 +2733,7 @@ namespace proc {
     // Clear any per-app runtime config overrides now that the app is terminating.
     // If we can safely hot-apply immediately, restore global config now; otherwise defer.
     if (has_run) {
-      config::clear_runtime_config_overrides();
+      hdr_runtime_owner::clear_runtime_overrides();
       if (!other_streaming_session_active) {
         config::apply_config_now();
       } else {
@@ -3952,6 +3969,7 @@ namespace proc {
         }
       }
       _apps = std::move(apps);
+      ++_app_state_revision;
       if (!app_was_running) {
         _env = std::move(env);
       }
@@ -3964,8 +3982,8 @@ namespace proc {
       return false;
     }
 
-    std::unordered_map<std::string, std::string> runtime_overrides;
-    bool changed = false;
+    std::unordered_map<std::string, std::string> desired_overrides;
+    std::uint64_t observed_app_revision = 0;
     {
       std::scoped_lock lk(_apps_mutex);
       if (_app_id <= 0 || _app.uuid != app_uuid) {
@@ -3978,53 +3996,14 @@ namespace proc {
       if (updated == _apps.end()) {
         return false;
       }
-
-      runtime_overrides = config::runtime_config_overrides_snapshot();
-      for (const auto key_view : RTX_HDR_LIVE_KEYS) {
-        const std::string key {key_view};
-        const auto old_app_value = _app.config_overrides.find(key);
-        const auto new_app_value = updated->config_overrides.find(key);
-        const auto runtime_value = runtime_overrides.find(key);
-
-        if (old_app_value == _app.config_overrides.end()) {
-          if (runtime_value != runtime_overrides.end()) {
-            continue;
-          }
-          if (new_app_value != updated->config_overrides.end()) {
-            runtime_overrides.emplace(key, new_app_value->second);
-            _app.config_overrides[key] = new_app_value->second;
-            changed = true;
-          }
-          continue;
-        }
-
-        if (runtime_value != runtime_overrides.end() && runtime_value->second != old_app_value->second) {
-          continue;
-        }
-
-        if (new_app_value != updated->config_overrides.end()) {
-          if (runtime_value == runtime_overrides.end() || runtime_value->second != new_app_value->second) {
-            runtime_overrides[key] = new_app_value->second;
-            changed = true;
-          }
-          _app.config_overrides[key] = new_app_value->second;
-        } else {
-          if (runtime_value != runtime_overrides.end()) {
-            runtime_overrides.erase(key);
-            changed = true;
-          }
-          _app.config_overrides.erase(key);
-        }
-      }
+      desired_overrides = updated->config_overrides;
+      observed_app_revision = _app_state_revision;
     }
-
-    if (!changed) {
-      return false;
-    }
-
-    config::set_runtime_config_overrides(std::move(runtime_overrides));
-    config::apply_config_now();
-    return true;
+    return update_active_app_live_rtx_hdr_overrides_impl(
+      app_uuid,
+      desired_overrides,
+      observed_app_revision
+    );
   }
 
   bool proc_t::update_active_app_live_rtx_hdr_overrides(
@@ -4035,50 +4014,76 @@ namespace proc {
       return false;
     }
 
-    std::unordered_map<std::string, std::string> runtime_overrides;
-    bool changed = false;
+    std::uint64_t observed_app_revision = 0;
     {
       std::scoped_lock lk(_apps_mutex);
       if (_app_id <= 0 || _app.uuid != app_uuid) {
         return false;
       }
+      observed_app_revision = _app_state_revision;
+    }
 
-      runtime_overrides = config::runtime_config_overrides_snapshot();
-      for (const auto key_view : RTX_HDR_LIVE_KEYS) {
-        const std::string key {key_view};
-        const auto old_app_value = _app.config_overrides.find(key);
-        const auto new_app_value = rtx_hdr_overrides.find(key);
-        const auto runtime_value = runtime_overrides.find(key);
+    return update_active_app_live_rtx_hdr_overrides_impl(
+      app_uuid,
+      rtx_hdr_overrides,
+      observed_app_revision
+    );
+  }
 
-        if (old_app_value == _app.config_overrides.end()) {
-          if (runtime_value != runtime_overrides.end()) {
-            continue;
-          }
-          if (new_app_value != rtx_hdr_overrides.end()) {
-            runtime_overrides.emplace(key, new_app_value->second);
-            _app.config_overrides[key] = new_app_value->second;
-            changed = true;
-          }
+  bool proc_t::update_active_app_live_rtx_hdr_overrides_impl(
+    const std::string &app_uuid,
+    const std::unordered_map<std::string, std::string> &rtx_hdr_overrides,
+    const std::uint64_t observed_app_revision
+  ) {
+    // Launch/resume/teardown owns stream_lifecycle_mutex() first.  The app
+    // lock is deliberately acquired only after that gate and revalidated
+    // against the snapshot taken above, so a live edit cannot publish over a
+    // newer HDR owner transaction.
+    std::unique_lock<std::mutex> lifecycle_lock(nvhttp::stream_lifecycle_mutex());
+    std::unique_lock<std::mutex> apps_lock(_apps_mutex);
+    if (_app_id <= 0 || _app.uuid != app_uuid ||
+        _app_state_revision != observed_app_revision) {
+      return false;
+    }
+
+    auto runtime_overrides = hdr_runtime_owner::runtime_overrides_snapshot();
+    bool changed = false;
+    for (const auto key_view : RTX_HDR_LIVE_KEYS) {
+      const std::string key {key_view};
+      const auto old_app_value = _app.config_overrides.find(key);
+      const auto new_app_value = rtx_hdr_overrides.find(key);
+      const auto runtime_value = runtime_overrides.find(key);
+
+      if (old_app_value == _app.config_overrides.end()) {
+        if (runtime_value != runtime_overrides.end()) {
           continue;
         }
-
-        if (runtime_value != runtime_overrides.end() && runtime_value->second != old_app_value->second) {
-          continue;
-        }
-
         if (new_app_value != rtx_hdr_overrides.end()) {
-          if (runtime_value == runtime_overrides.end() || runtime_value->second != new_app_value->second) {
-            runtime_overrides[key] = new_app_value->second;
-            changed = true;
-          }
+          runtime_overrides.emplace(key, new_app_value->second);
           _app.config_overrides[key] = new_app_value->second;
-        } else {
-          if (runtime_value != runtime_overrides.end()) {
-            runtime_overrides.erase(key);
-            changed = true;
-          }
-          _app.config_overrides.erase(key);
+          changed = true;
         }
+        continue;
+      }
+
+      if (runtime_value != runtime_overrides.end() &&
+          runtime_value->second != old_app_value->second) {
+        continue;
+      }
+
+      if (new_app_value != rtx_hdr_overrides.end()) {
+        if (runtime_value == runtime_overrides.end() ||
+            runtime_value->second != new_app_value->second) {
+          runtime_overrides[key] = new_app_value->second;
+          changed = true;
+        }
+        _app.config_overrides[key] = new_app_value->second;
+      } else {
+        if (runtime_value != runtime_overrides.end()) {
+          runtime_overrides.erase(key);
+          changed = true;
+        }
+        _app.config_overrides.erase(key);
       }
     }
 
@@ -4086,7 +4091,10 @@ namespace proc {
       return false;
     }
 
-    config::set_runtime_config_overrides(std::move(runtime_overrides));
+    ++_app_state_revision;
+    apps_lock.unlock();
+    hdr_runtime_owner::publish_external_runtime_overrides(runtime_overrides);
+    lifecycle_lock.unlock();
     config::apply_config_now();
     return true;
   }

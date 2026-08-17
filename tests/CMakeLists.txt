@@ -224,6 +224,20 @@ target_include_directories(sunshine_test_nanors_headers SYSTEM INTERFACE
 
 enable_testing()
 
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_LIST_DIR}/static/check_hdr_runtime_inventory.cmake"
+    "${CMAKE_CURRENT_LIST_DIR}/static/hdr_runtime_inventory.txt"
+    "${CMAKE_CURRENT_LIST_DIR}/static/hdr_runtime_writer_inventory.txt"
+    "${CMAKE_CURRENT_LIST_DIR}/static/hdr_route_inventory.txt")
+add_test(
+    NAME test_static_hdr_runtime_inventory
+    COMMAND "${CMAKE_COMMAND}"
+        "-DROOT=${SUNSHINE_TEST_REPOSITORY_ROOT}"
+        "-DINVENTORY=${CMAKE_CURRENT_LIST_DIR}/static/hdr_runtime_inventory.txt"
+        "-DWRITER_INVENTORY=${CMAKE_CURRENT_LIST_DIR}/static/hdr_runtime_writer_inventory.txt"
+        "-DROUTE_INVENTORY=${CMAKE_CURRENT_LIST_DIR}/static/hdr_route_inventory.txt"
+        -P "${CMAKE_CURRENT_LIST_DIR}/static/check_hdr_runtime_inventory.cmake")
+
 # The foundation target proves that the fast path needs only GTest and the
 # universal test entry. Registrations use the test_fast_ and test_component_
 # naming convention and must declare their exact sources, definitions, and link
@@ -363,6 +377,20 @@ sunshine_register_component(NAME test_component_process_policy TEST_SOURCE unit/
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/app_catalog_policy.cpp")
 sunshine_register_component(NAME test_component_process_framegen_json TEST_SOURCE unit/test_process_framegen_json.cpp
     PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/app_framegen_config.cpp")
+sunshine_register_component(NAME test_component_client_hdr_capabilities TEST_SOURCE unit/test_client_hdr_capabilities.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/client_hdr_capabilities.cpp")
+sunshine_register_component(NAME test_component_hdr_peak_policy TEST_SOURCE unit/test_hdr_peak_policy.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/hdr_peak_policy.cpp")
+sunshine_register_component(NAME test_component_hdr_runtime_owner TEST_SOURCE unit/test_hdr_runtime_owner.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/hdr_runtime_owner.cpp")
+sunshine_register_component(NAME test_component_hdr_request_policy TEST_SOURCE unit/test_hdr_request_policy.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/hdr_request_policy.cpp")
+sunshine_register_component(NAME test_component_http_request_view TEST_SOURCE unit/test_http_request_view.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/http_request_view.cpp"
+    LINK_LIBRARIES ws2_32)
+sunshine_register_component(NAME test_component_rtsp_startup_snapshot TEST_SOURCE unit/test_rtsp_startup_snapshot.cpp
+    PRODUCT_SOURCES "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/rtsp_startup_snapshot.cpp"
+    LINK_LIBRARIES OpenSSL::Crypto)
 sunshine_register_component(NAME test_component_session_history TEST_SOURCE unit/test_session_history.cpp
     PRODUCT_SOURCES
         "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/session_history_storage.cpp"
@@ -392,7 +420,8 @@ sunshine_register_component(NAME test_component_encoder_probe_policy TEST_SOURCE
 sunshine_register_component(NAME test_component_resource_config_catalog TEST_SOURCE unit/test_config_catalog_contract.cpp
     INCLUDE_DIRECTORIES "${SUNSHINE_TEST_GENERATED_INCLUDE_DIR}")
 sunshine_register_component(NAME test_component_resource_locale_catalog TEST_SOURCE integration/test_locale_consistency.cpp
-    SUPPORT_SOURCES "${CMAKE_CURRENT_LIST_DIR}/support/file_handler_read_only.cpp")
+    SUPPORT_SOURCES "${CMAKE_CURRENT_LIST_DIR}/support/file_handler_read_only.cpp"
+    DEFINITIONS "SUNSHINE_SOURCE_DIR=\"${SUNSHINE_TEST_REPOSITORY_ROOT}\"")
 sunshine_register_component(NAME test_component_external_command_policy TEST_SOURCE integration/test_external_commands.cpp)
 sunshine_register_component(NAME test_component_virtual_display_manifest TEST_SOURCE integration/test_virtual_display_packaging.cpp
     INCLUDE_DIRECTORIES "${SUNSHINE_TEST_GENERATED_INCLUDE_DIR}")
