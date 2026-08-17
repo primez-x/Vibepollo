@@ -1632,16 +1632,30 @@ namespace platf::audio {
         }
 
         prop_var_t adapter_friendly_name;
-        if (FAILED(properties->GetValue(PKEY_DeviceInterface_FriendlyName, &adapter_friendly_name.prop)) ||
+        // Audio endpoint devnodes expose their human-readable adapter name as
+        // PKEY_Device_FriendlyName. PKEY_DeviceInterface_FriendlyName is an
+        // interface property and is empty when queried from IMMDevice's
+        // endpoint property store, which would make the visibility snapshot
+        // fail closed before any handoff writes occur.
+        const auto friendly_name_status = properties->GetValue(PKEY_Device_FriendlyName, &adapter_friendly_name.prop);
+        if (FAILED(friendly_name_status) ||
             adapter_friendly_name.prop.vt != VT_LPWSTR ||
             !adapter_friendly_name.prop.pwszVal ||
             adapter_friendly_name.prop.pwszVal[0] == L'\0') {
-          return std::nullopt;
+          // Stale disabled/unplugged endpoint records can legitimately lack a
+          // friendly name. Their ID and original state are still sufficient to
+          // restore visibility; only Steam endpoints need names for topology
+          // classification, and the pair check below still fails closed if
+          // either Steam half cannot be identified.
+          BOOST_LOG(warning) << "Render endpoint has no friendly name; preserving it by ID/state: index ["
+                             << index << "] id [" << utf_utils::to_utf8(device_id.get())
+                             << "] HRESULT [0x" << util::hex(friendly_name_status).to_string_view() << ']';
         }
 
         endpoints.push_back({
           utf_utils::to_utf8(device_id.get()),
-          utf_utils::to_utf8(adapter_friendly_name.prop.pwszVal),
+          adapter_friendly_name.prop.vt == VT_LPWSTR && adapter_friendly_name.prop.pwszVal ?
+            utf_utils::to_utf8(adapter_friendly_name.prop.pwszVal) : std::string {},
           state == DEVICE_STATE_ACTIVE,
         });
       }
@@ -1682,8 +1696,12 @@ namespace platf::audio {
           continue;
         }
         virtual_ids.push_back(endpoint.id);
-        has_speakers = has_speakers || endpoint.adapter_name == "Steam Streaming Speakers";
-        has_microphone = has_microphone || endpoint.adapter_name == "Steam Streaming Microphone";
+        has_speakers = has_speakers ||
+          endpoint.adapter_name == "Steam Streaming Speakers" ||
+          endpoint.adapter_name == "Speakers (Steam Streaming Speakers)";
+        has_microphone = has_microphone ||
+          endpoint.adapter_name == "Steam Streaming Microphone" ||
+          endpoint.adapter_name == "Speakers (Steam Streaming Microphone)";
       }
 
       // Host mute owns both halves of the Steam topology. If either half is

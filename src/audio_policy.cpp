@@ -52,7 +52,9 @@ namespace audio::policy {
 
   bool is_steam_streaming_render_adapter(std::string_view adapter_name) {
     return adapter_name == "Steam Streaming Speakers" ||
-           adapter_name == "Steam Streaming Microphone";
+           adapter_name == "Steam Streaming Microphone" ||
+           adapter_name == "Speakers (Steam Streaming Speakers)" ||
+           adapter_name == "Speakers (Steam Streaming Microphone)";
   }
 
   render_endpoint_catalog_t build_render_endpoint_catalog(
@@ -152,7 +154,7 @@ namespace audio::policy {
     }
 
     for (const auto &endpoint : endpoints) {
-      if (endpoint.id.empty() || endpoint.adapter_name.empty()) {
+      if (endpoint.id.empty()) {
         return std::nullopt;
       }
       if (!endpoint.active ||
