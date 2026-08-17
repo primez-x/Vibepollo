@@ -865,6 +865,7 @@ namespace webrtc_stream {
       std::optional<config::runtime_output_override_lease_t> output_override_lease;
 #endif
       std::shared_ptr<safe::mail_raw_t> mail;
+      safe::mail_raw_t::event_t<bool> shutdown_event;
       std::shared_ptr<rtsp_stream::launch_session_t> launch_session;
       std::thread video_thread;
       std::thread audio_thread;
@@ -3296,6 +3297,7 @@ namespace webrtc_stream {
       }
 
       auto mail = std::make_shared<safe::mail_raw_t>();
+      auto shutdown_event = mail->event<bool>(mail::shutdown);
       std::thread pending_video_thread;
       std::thread pending_audio_thread;
 #ifdef SUNSHINE_ENABLE_WEBRTC
@@ -3311,9 +3313,7 @@ namespace webrtc_stream {
         // a failed thread construction or stale commit cannot strand a capture
         // that is not represented by active ownership.
         try {
-          if (const auto shutdown_event = mail->event<bool>(mail::shutdown)) {
-            shutdown_event->raise(true);
-          }
+          shutdown_event->raise(true);
         } catch (...) {
         }
         webrtc_capture.feedback_shutdown.store(true, std::memory_order_release);
@@ -3340,6 +3340,7 @@ namespace webrtc_stream {
         }
 #endif
         webrtc_capture.feedback_queue.reset();
+        webrtc_capture.shutdown_event.reset();
         webrtc_capture.mail.reset();
         webrtc_capture.launch_session.reset();
         webrtc_capture.app_id.reset();
@@ -3350,6 +3351,7 @@ namespace webrtc_stream {
         webrtc_capture.active.store(false, std::memory_order_release);
       });
       webrtc_capture.mail = mail;
+      webrtc_capture.shutdown_event = shutdown_event;
       webrtc_capture.launch_session = launch_session;
       webrtc_capture.app_id = effective_app_id > 0 ? std::optional<int> {effective_app_id} : std::nullopt;
       webrtc_capture.config_key = desired_key;
@@ -3477,9 +3479,8 @@ namespace webrtc_stream {
             webrtc_capture.launch_session->virtual_display_guid_bytes;
         }
 
-        if (webrtc_capture.mail) {
-          auto shutdown_event = webrtc_capture.mail->event<bool>(mail::shutdown);
-          shutdown_event->raise(true);
+        if (webrtc_capture.mail && webrtc_capture.shutdown_event) {
+          webrtc_capture.shutdown_event->raise(true);
         }
         webrtc_capture.feedback_shutdown.store(true, std::memory_order_release);
         if (webrtc_capture.feedback_queue) {
@@ -3515,6 +3516,7 @@ namespace webrtc_stream {
       {
         std::unique_lock<std::mutex> capture_lock(webrtc_capture.mutex);
         webrtc_capture.feedback_queue.reset();
+        webrtc_capture.shutdown_event.reset();
         webrtc_capture.mail.reset();
         webrtc_capture.launch_session.reset();
         webrtc_capture.app_id.reset();

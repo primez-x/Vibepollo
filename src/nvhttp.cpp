@@ -3839,8 +3839,16 @@ namespace nvhttp {
         tree.put("root.gamesession", 0);
       }
 
-      tree.put("root.<xmlattr>.status_code", 200);
-      tree.put(
+      // Keep the response in a non-success state until the launch entry has
+      // been handed to RTSP. If the handoff throws, the fail guard must not
+      // tell the client that a nonexistent session is ready.
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 500);
+      tree.put("root.<xmlattr>.status_message", "Failed to queue streaming session");
+      tree.put("root.gamesession", 0);
+      pt::ptree success_tree;
+      success_tree.put("root.<xmlattr>.status_code", 200);
+      success_tree.put(
         "root.sessionUrl0",
         std::format(
           "{}{}:{}",
@@ -3849,16 +3857,17 @@ namespace nvhttp {
           static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
         )
       );
-      tree.put("root.gamesession", 1);
+      success_tree.put("root.gamesession", 1);
 #ifdef _WIN32
-      tree.put("root.VirtualDisplayDriverReady", proc::vDisplayDriverStatus.load(std::memory_order_acquire) == VDISPLAY::DRIVER_STATUS::OK);
+      success_tree.put("root.VirtualDisplayDriverReady", proc::vDisplayDriverStatus.load(std::memory_order_acquire) == VDISPLAY::DRIVER_STATUS::OK);
 #else
-      tree.put("root.VirtualDisplayDriverReady", false);
+      success_tree.put("root.VirtualDisplayDriverReady", false);
 #endif
       stream::session::arm_shared_runtime_cleanup(
         launch_session->virtual_display_guid_bytes
       );
       rtsp_stream::launch_session_raise(launch_session);
+      tree.swap(success_tree);
 #ifdef _WIN32
       pending_vulkan_hdr_layer_guard.disable();
 #endif
@@ -4363,8 +4372,15 @@ namespace nvhttp {
       return;
     }
 
-    tree.put("root.<xmlattr>.status_code", 200);
-    tree.put(
+    // Keep the response in a non-success state until the resume entry has
+    // been handed to RTSP. If the handoff throws, the fail guard must not
+    // tell the client that a nonexistent session is ready.
+    tree.put("root.resume", 0);
+    tree.put("root.<xmlattr>.status_code", 500);
+    tree.put("root.<xmlattr>.status_message", "Failed to queue streaming session");
+    pt::ptree success_tree;
+    success_tree.put("root.<xmlattr>.status_code", 200);
+    success_tree.put(
       "root.sessionUrl0",
       std::format(
         "{}{}:{}",
@@ -4373,19 +4389,20 @@ namespace nvhttp {
         static_cast<int>(net::map_port(rtsp_stream::RTSP_SETUP_PORT))
       )
     );
-    tree.put("root.resume", 1);
+    success_tree.put("root.resume", 1);
 
 #ifdef _WIN32
 
-    tree.put("root.VirtualDisplayDriverReady", proc::vDisplayDriverStatus.load(std::memory_order_acquire) == VDISPLAY::DRIVER_STATUS::OK);
+    success_tree.put("root.VirtualDisplayDriverReady", proc::vDisplayDriverStatus.load(std::memory_order_acquire) == VDISPLAY::DRIVER_STATUS::OK);
 #else
-    tree.put("root.VirtualDisplayDriverReady", false);
+    success_tree.put("root.VirtualDisplayDriverReady", false);
 #endif
 
     stream::session::arm_shared_runtime_cleanup(
       launch_session->virtual_display_guid_bytes
     );
     rtsp_stream::launch_session_raise(launch_session);
+    tree.swap(success_tree);
 #ifdef _WIN32
     virtual_display_teardown_guard.disable();
 #endif

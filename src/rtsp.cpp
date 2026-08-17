@@ -719,7 +719,8 @@ namespace rtsp_stream {
         if (entry != _launch_sessions.end()) {
           _launch_sessions.erase(entry);
         }
-        arm_launch_timer_locked();
+        // The failed post did not touch the executor's existing timer. Leave
+        // it intact so an older pending launch keeps its original expiry.
         throw;
       }
     }
