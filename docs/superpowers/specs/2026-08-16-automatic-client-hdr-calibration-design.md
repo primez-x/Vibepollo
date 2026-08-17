@@ -160,6 +160,14 @@ protocol, while its request logger and generic query parser consume the same
 sanitized view. The route-inventory check covers both HTTP surfaces, so a
 capability-shaped secret cannot appear in either logger or parser.
 
+The initial configuration-surface inventory is `confighttp.cpp:5701-5857` for
+all default/resource registrations, `confighttp.cpp:580-595,1037,1072,1336,
+3307,3334,3911,3956,4323,5076,5416,5656` for logger/parser and web-UI launch
+seams, `confighttp_rtss.cpp:38,95,233-235`, and
+`confighttp_playnite.cpp:62,130,228,258,288,320,372,411,425,468,1349,2137,
+2182,2228-2259`. Implementation must enumerate every route and every raw
+parser/logger access in all three files and leave zero unclassified accesses.
+
 The adapter scans the corresponding raw request query before copying or
 percent-decoding. It removes every case-insensitive
 `clientDisplayCapabilities` field from the query view while retaining all
@@ -443,6 +451,26 @@ finalizer in `stream.cpp:2705-2808` and every RTSP/WebRTC caller of it must
 invoke the matching transition under `stream_lifecycle_gate`; no backend may
 clear or retain the map by changing only its local stream state. This includes
 RTSP timeout, RTSP teardown, WebRTC teardown, and application termination.
+
+Cross-domain process edits use one lock order: acquire
+`stream_lifecycle_gate` before `_apps_mutex`; no path may acquire the lifecycle
+gate while holding `_apps_mutex`. A live app edit snapshots and validates its
+app UUID/revision under `_apps_mutex`, releases it, acquires the lifecycle gate,
+revalidates the revision, performs the manager transaction, and commits app
+state without calling `config::apply_config_now()` until both locks are
+released. Process termination retains its existing gate-first entry. Lock-order
+assertions and a stress test cover simultaneous app edits, launch/resume,
+teardown, and termination.
+
+The initial lifecycle inventory is pinned to `stream.cpp:2705-2808,2993-3005`,
+RTSP callers at `rtsp.cpp:672-677,724-756,819-846,1076-1127,1137-1163,1882`,
+WebRTC callers at `webrtc_stream.cpp:3014,3456-3462,3491,3500,5419,5518,5544,5641`,
+process/runtime writers at `process.cpp:2513-2523,2719,3962-4027,4030-4091`,
+HTTP/runtime writers at `nvhttp.cpp:3217,3300-3340,3786-3795,4168-4170,4913`,
+and external termination callers at `confighttp.cpp:2220,2855,5223,5245`,
+`main.cpp:528`, `system_tray.cpp:107,113,120,530`, and
+`platform/windows/playnite_integration.cpp:947`. Implementation must rerun
+the repository inventory and leave zero unclassified lifecycle or map writers.
 
 ## User interface and documentation
 

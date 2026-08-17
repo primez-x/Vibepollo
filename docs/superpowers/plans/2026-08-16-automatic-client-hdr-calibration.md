@@ -146,8 +146,39 @@
 6. Use the existing launch_request_mutex and stream_lifecycle_gate acquired by the /launch and /resume routes at nvhttp.cpp:4561-4576 as the atomic owner-selection seam. While that gate observes no activity, `begin_candidate` snapshots the prior runtime map/owner, evaluates, and publishes one target under a generation lease. If activity is present, the request must preserve the existing runtime target and mark its session result shared-active-session; it must not evaluate a client peak into global overrides. has_stream_session_activity() already includes pending RTSP/WebRTC activity and teardown.
 7. Keep the lease beyond the HTTP handler: HTTP success moves it to `awaiting-stream` and creates a participant in an awaiting-stream cohort. A pending join binds to that same cohort and receives its own participant token. The first RTSP/WebRTC ownership publication from any participant commits the matching generation for the entire cohort; cancellation removes only that participant. Rollback is allowed only when the cohort has no pending participants and no active publication. Thus A-cancel/B-start, B-start/A-cancel, B-cancel/A-start, both-cancel, and mixed RTSP/WebRTC ordering cannot let a stale participant undo a committed or still-pending cohort. Synchronous request failure, pending-session expiry, virtual-display failure, and asynchronous stream-start failure roll back the matching prior map and owner only after the cohort is empty. A stale rollback cannot overwrite a newer generation. Add explicit manager callbacks at `stream.cpp:2705-2808` and every RTSP/WebRTC caller for participant cancel/expiry, first publication, stream teardown, paused retention, replacement, and termination; no local backend cleanup may clear or retain the map independently. Last-stream teardown while the app remains paused changes the owner to `retained-paused` without clearing the map; a later idle request may replace it transactionally; application termination clears map and owner together.
 8. Promote the existing `stream_lifecycle_gate`/scoped access into the owner-manager API rather than adding a second lock. Make the manager the sole production authority for the complete runtime override map: `config::set_runtime_config_overrides()` and `clear_runtime_config_overrides()` become manager-private low-level operations, and all unrelated-key edits use a manager transaction that reads, modifies, publishes, and increments a monotonic map revision under the same gate. Each lease records its generation, map revision, owned keys, and candidate values. Rollback conditionally restores only lease-owned HDR entries when the generation is current and those entries still equal the lease's candidate; it must preserve unrelated keys and a newer explicit HDR edit. A generic whole-map replacement that omits `rtx_hdr_peak_brightness` cannot bypass owner invalidation or silently clear an owned target. Route WebRTC's current first-capture runtime-map writer (`webrtc_stream.cpp:3088-3105`), application termination, live `rtx_hdr_peak_brightness` edits, and every existing whole-map caller through the manager. Before implementation, run a repository-wide inventory over `src/**/*.cpp` and `src/**/*.h` for every call to `set_runtime_config_overrides`, `clear_runtime_config_overrides`, direct runtime-map assignment/clear, and every construction of a map containing `rtx_hdr_peak_brightness`; record the exact file/line and classify each as manager-owned, low-level definition, or unrelated-key transaction. The known baseline includes `nvhttp.cpp:3300,3333,3340,3786,3795`, `webrtc_stream.cpp:3094,3104`, `process.cpp:2719,4025,4089`, and the `config.cpp:3186,3220` low-level definitions. After the refactor, no production caller outside `hdr_runtime_owner.cpp` may call the low-level set/clear API. Add a repository test/static check that fails on any unclassified or non-manager writer, and add generation/map-revision rejection tests for every inventoried failure, teardown, termination, unrelated-key edit, and live-edit path.
+   Enforce one lock order for the cross-domain process paths: acquire
+   `stream_lifecycle_gate` before `_apps_mutex`; no code may acquire the gate
+   while holding `_apps_mutex`. Live app-edit code must snapshot and validate
+   app state under `_apps_mutex`, release it, acquire the lifecycle gate, then
+   revalidate an app revision/UUID before the manager transaction and any
+   committed app-state update. `config::apply_config_now()` runs after both
+   locks are released. `proc_t::terminate()` retains its existing gate-first
+   entry. Add lock-order assertions and a stress test for simultaneous app
+   edits, launch/resume, teardown, and termination.
+   The mandatory current-source lifecycle inventory before implementation is:
+   `src/stream.cpp:2705-2808,2993-3005`; RTSP finalizer callers at
+   `src/rtsp.cpp:672-677,724-756,819-846,1076-1127,1137-1163,1882`;
+   WebRTC finalizer/lock callers at
+   `src/webrtc_stream.cpp:3014,3456-3462,3491,3500,5419,5518,5544,5641`;
+   process termination/runtime writers at
+   `src/process.cpp:2513-2523,2719,3962-4027,4030-4091`; HTTP/runtime
+   writers at `src/nvhttp.cpp:3217,3300-3340,3786-3795,4168-4170,4913`;
+   configuration and external termination callers at
+   `src/confighttp.cpp:2220,2855,5223,5245`, `src/main.cpp:528`,
+   `src/system_tray.cpp:107,113,120,530`, and
+   `src/platform/windows/playnite_integration.cpp:947`. The inventory must
+   be rerun and must finish with zero unclassified lifecycle or map writers.
 9. Keep any selected host profile associated with the session even if its MHC2 read fails, suppress client values in that case, and use the existing global fallback.
 10. Keep every `print_req()` downstream of the common raw-query adapter so it receives only `request_query_view`. Also make its redaction helper case-insensitive for defense in depth; for every route and regardless of validity/size it may log only presence/status/reason and never the base64, raw query segment, or decoded JSON. The route-inventory test must enumerate every `http_server.resource`, `http_server.default_resource`, and HTTPS equivalent registration in `nvhttp.cpp` plus every `confighttp*.cpp` route, assert that its callback is wrapped, and exercise each wrapper with a secret capability value to prove no logger/parser path receives raw bytes. Configuration web-UI launch handlers must receive an explicitly empty capability snapshot.
+   Pin the initial configuration-HTTP inventory to
+   `confighttp.cpp:5701-5857` (all default/resource registrations),
+   `confighttp.cpp:580-595,1037,1072,1336,3307,3334,3911,3956,4323,5076,
+   5416,5656` (logger/parser and web-UI launch seams),
+   `confighttp_rtss.cpp:38,95,233-235`, and
+   `confighttp_playnite.cpp:62,130,228,258,288,320,372,411,425,468,
+   1349,2137,2182,2228-2259` (callback/logger/parser seams). The static
+   check must enumerate every route and every raw parser/logger access in all
+   three files, not only the main configuration implementation.
 11. Keep /launch and /resume behavior symmetric and preserve old-client behavior when the field is missing.
 12. Add `ClientDisplayCapabilitiesVersion=1` to Vibepollo's `/serverinfo`
     response. The field is a protocol advertisement only; it does not expose
