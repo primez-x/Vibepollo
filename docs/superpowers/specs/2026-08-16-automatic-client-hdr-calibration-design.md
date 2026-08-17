@@ -1,7 +1,7 @@
 # Automatic Client HDR Calibration Inheritance
 
 **Date:** 2026-08-16
-**Status:** Approved design pending implementation-plan review
+**Status:** Approved design revised after implementation-plan review
 
 ## Problem
 
@@ -30,9 +30,11 @@ same effective peak-brightness path already used by manual HDR profile and
 numeric overrides.
 
 Automatic selection must prefer the calibrated values reported by the active
-client ICC profile, use the active display's EDID/DXGI values when calibrated
-values are unavailable, and retain the existing global fallback for clients
-that report neither.
+client ICC profile, use the active display's Windows/DXGI-reported values when
+calibrated values are unavailable, and retain the existing global fallback for
+clients that report neither. The fallback is EDID-derived when Windows reports
+it from the display descriptor, but v1 does not claim that
+IDXGIOutput6::GetDesc1() is a raw EDID read.
 
 The existing manual host profile and explicit numeric peak override remain
 available for handheld, tablet, older, non-Windows, or otherwise incapable
@@ -71,10 +73,12 @@ case the existing global fallback is retained while the selected host profile
 continues through the existing association path.
 
 The client reports values, not a profile path or file. The calibrated source
-is the active display profile associated with the display where Moonlight will
-place the stream window. The client also reads the same display's EDID/DXGI
-descriptor so the host can distinguish calibrated values from hardware
-capability values and use the latter as a safe fallback.
+is the active extended-color display profile associated with the display where
+Moonlight will place the stream window. The wire object's `edid` member is
+retained for v1 compatibility, but its `source` is `dxgi-output`: the value is
+the selected Windows/DXGI display descriptor and may reflect EDID, driver, or
+Windows-rationalized data. The client also reads that same descriptor so the
+host can distinguish calibrated values from the display-reported fallback.
 
 For the current Vibepollo pipeline, the peak luminance value is the only
 client field that changes behavior in v1. It is passed through the existing
@@ -144,19 +148,33 @@ risking data from the wrong monitor.
 MoonlightQt adds a Windows-only capability collector used before the
 asynchronous launch request is started:
 
-1. On the GUI thread, use the selected `QQuickWindow` screen and the existing
-   hidden test-window placement to resolve the display that the real stream
-   window will use. The real SDL stream window does not exist until after the
-   host launch request, so it must not be queried from the launch worker.
-2. Resolve the active Windows color profile for that display.
-3. Parse the profile's MHC2 calibration data and populate `calibrated` with
-   the verified fixed-point peak field already understood by Vibepollo. The
-   client must use the same rounding and validity bounds as the host.
-4. Read the output's EDID-derived DXGI descriptor and populate `edid` with
-   `IDXGIOutput6::GetDesc1().MaxLuminance`, converted to the integer wire
-   value in nits.
-5. Serialize only the normalized peak values; never send the client file
-   path, profile filename, monitor serial, or raw ICC/EDID bytes.
+1. On the GUI thread, resolve the selected `QQuickWindow` screen to exactly one
+   SDL display using the existing display geometry path, move the hidden test
+   window, and verify that `SDL_GetWindowDisplayIndex()` reports the same
+   display. A null, unmatched, duplicated, or changed mapping is unresolved:
+   keep the existing rendering fallback if needed, but send no capability
+   payload. The real SDL stream window does not exist until after the host
+   launch request, so it must not be queried from the launch worker.
+2. Map that display's GDI/DXGI identity to a `DISPLAYCONFIG` source adapter LUID
+   and source ID, reusing the existing mapping approach in
+   `d3d11va.cpp`. Dynamically resolve the Windows ColorProfile APIs from
+   `mscms.dll` so older supported Windows versions remain loadable when those
+   exports are unavailable.
+3. Query `ColorProfileGetDisplayUserScope()` and
+   `ColorProfileGetDisplayDefault()` with `CPT_ICC` and
+   `CPST_EXTENDED_DISPLAY_COLOR_MODE`. Read the returned profile only locally,
+   bound the file to the same 32 MiB/structural checks as the host, and parse
+   its MHC2 peak. Missing exports, unsupported OS builds, missing profiles,
+   `STANDARD`-only profiles, and parse failures produce no calibrated value.
+4. Query the selected DXGI output through
+   `IDXGIOutput6::GetDesc1()`. Populate the wire object's `edid` member with
+   `source: "dxgi-output"` only when the descriptor is current, uniquely
+   mapped, HDR-capable, and has a finite positive `MaxLuminance`; otherwise
+   omit it. This is a Windows/DXGI display-reported fallback, not a claim of
+   raw EDID provenance.
+5. Serialize only the normalized peak values; never send the client file path,
+   profile filename, monitor serial, adapter identifiers, or raw ICC/EDID
+   bytes.
 
 The collector must tolerate missing profiles, displays without HDR support,
 profile parse failures, and Windows API races. It should log the local source
@@ -192,11 +210,14 @@ The selected effective peak must be available before:
 - any other backend that explicitly accepts the same target field.
 
 The log source should distinguish at least `explicit-override`,
-`host-icc-mhc2`, `client-icc-mhc2`, `client-edid`, and `global-default`.
+`host-icc-mhc2`, `client-icc-mhc2`, `client-dxgi-output`, and
+`global-default`. v1 does not add a live source-status API; the settings UI
+explains the static policy, while redacted runtime logs identify the selected
+source and fallback reason.
 
 If the client sends calibrated data but no valid peak, the host may use its
-must use EDID/global peak fallback. If the client sends no payload, all
-existing non-client behavior remains unchanged.
+DXGI/global peak fallback. If the client sends no payload, all existing
+non-client behavior remains unchanged.
 
 ### Backend and shared-session ownership
 
@@ -208,14 +229,16 @@ reported peak may feed RTX HDR, but the host must not claim that SudoVDA's
 virtual EDID was matched. Manual host profiles remain the exact fallback for
 that backend. A future SudoVDA protocol extension is outside this change.
 
-The host runtime override is process-wide. When no stream is active, the first
-session resolves the effective target and owns it. If a second RTSP/WebRTC
-client joins while a stream is active, its capability data must not mutate the
-active runtime target; it inherits the active target or is reported as
-`shared-active-session`. This preserves the existing shared-display rule that
-the first active client owns the shared monitor's HDR peak. Per-session
-capability fields may still be retained for diagnostics, but they do not
-retarget global capture/encoder state.
+The host runtime override is process-wide. The existing HTTP route locks
+`launch_request_mutex` and `stream_lifecycle_gate` serialize launch/resume
+ownership decisions. While holding that lifecycle gate, an idle first session
+resolves and publishes the effective target. A joining RTSP/WebRTC request
+observes activity and must not mutate the active runtime target; it inherits
+the already-published runtime value. A failed first launch must release or
+restore the provisional override, and final-session teardown must clear it
+through the existing runtime-override lifecycle. Per-session capability fields
+may still be retained for logs, but they do not retarget global
+capture/encoder state.
 
 ## User interface and documentation
 
@@ -245,7 +268,9 @@ translation/fallback conventions rather than replacing unrelated translations.
   client-side protocol change.
 - GFE launch/resume requests do not receive the custom parameter; the current
   GFE request shape remains unchanged.
-- Old Vibepollo hosts ignore the unknown launch parameter from a newer client.
+- Old Vibepollo hosts must ignore the unknown launch parameter from a newer
+  client; the implementation plan must source-check the pre-feature query
+  parser and add a concrete gate if any supported historical host rejects it.
 - No client-supplied value is persisted or treated as trusted configuration.
 - No client-supplied path is opened by the host.
 - Payload size, numeric ranges, and JSON structure are bounded before use.
@@ -259,16 +284,20 @@ translation/fallback conventions rather than replacing unrelated translations.
 
 - Unit-test profile/MHC2 extraction for valid, absent, truncated, malformed,
   and out-of-range profiles.
-- Unit-test EDID/DXGI peak normalization and omission behavior when the
-  output or descriptor is unavailable.
+- Unit-test Windows/DXGI peak normalization and omission behavior when the
+  output is SDR, cloned, detached, ambiguous, stale, or unavailable. The
+  source label is `client-dxgi-output`; `edid` is only the v1 wire member name.
 - Unit-test serialization for calibrated-plus-EDID, calibrated-only,
   EDID-only, and no-data cases.
 - Verify the launch request includes the new parameter before both launch and
   resume calls for non-GFE HDR sessions, omits it for GFE/SDR sessions, and
   retains the existing HDR query fields.
 - Verify multi-monitor mapping through the pre-launch QQuickWindow/hidden-test
-  window path, including negative-coordinate displays and an unresolved-output
-  omission.
+  window path, including negative-coordinate displays, duplicate/mirrored
+  geometry, hidden-window placement mismatch, and unresolved-output omission.
+- Verify missing modern Windows color APIs and pre-20348 behavior leave
+  Moonlight loadable and omit calibrated data while preserving the DXGI/global
+  fallback.
 
 ### Vibepollo
 
@@ -286,8 +315,9 @@ translation/fallback conventions rather than replacing unrelated translations.
   cannot retarget process-global runtime state.
 - Unit-test request logging redaction for the custom capability parameter.
 - Test Sunshine virtual-display creation with a client calibrated peak and
-  verify the requested HDR EDID peak. Test SudoVDA separately and verify the
-  explicit runtime-only diagnostic without claiming EDID inheritance.
+  verify the requested HDR display-reported peak. Test SudoVDA separately and
+  verify the explicit runtime-only diagnostic without claiming exact virtual
+  display inheritance.
 
 ### End-to-end Windows smoke test
 
@@ -295,11 +325,11 @@ With a calibrated HDR Windows display and the modified Windows Moonlight
 client, start an HDR stream and verify the host log reports
 `client-icc-mhc2` with the expected peak before Sunshine virtual-display
 creation. Remove or disable the active calibration profile and verify the same
-client falls back to `client-edid`. Finally, use an explicit host profile or
+client falls back to `client-dxgi-output`. Finally, use an explicit host profile or
 numeric override and verify it remains authoritative, including when the host
 profile's MHC2 peak is unreadable. Run the same matrix against SudoVDA and
-record whether the backend provides exact EDID inheritance or the documented
-runtime-only fallback.
+record whether the backend provides exact virtual-display inheritance or the
+documented runtime-only fallback.
 
 ## Expected result
 
