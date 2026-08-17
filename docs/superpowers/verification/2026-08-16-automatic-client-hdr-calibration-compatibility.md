@@ -11,7 +11,7 @@ launch/resume compatibility remains pending.
 ## Evidence boundary
 
 - The exact host implementation revision is
-  `bb4632271d5b16be4455f0892a713b07681ce47c`. The staged host build produced
+  `628a98322045bfb17f35bb215915ca565245468d`. The staged host build produced
   `sunshine.exe` on 2026-08-17.
 - The exact client implementation revision is
   `c6e5764343a5c9a28ecfe3cb34348a1b420f2e9c`. The staged Windows client build
@@ -37,8 +37,8 @@ environment or hardware needed for the row is not present; it is not a pass.
 | Row | Classification | Exact host revision | Advertisement | Launch | Resume | Status | Reason | Expected decision |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Pinned pre-feature Vibepollo `f8c4ac2762b351457ee57aef0863655d18b936e4` | software-required | `f8c4ac2762b351457ee57aef0863655d18b936e4` | `absent` (static source observation; runtime pending) | `pending` | `pending` | `pending` | No built pinned host/client pairing is available in this checkout. | Omit field for both verbs. |
-| Current Vibepollo implementation commit | software-required | `bb4632271d5b16be4455f0892a713b07681ce47c` | `pending` (source advertises `1`; runtime `/serverinfo` not captured) | `pending` | `pending` | `pending` | Host/client builds and focused contract tests pass, but no connected launch/resume capture was available. | Advertise `1`; accept the field and resolve the peak for both verbs. |
-| Pinned old Moonlight client → current Vibepollo | software-required | `bb4632271d5b16be4455f0892a713b07681ce47c` | `pending` (current source advertises `1`) | `pending` | `pending` | `pending` | No pinned old Moonlight client checkout or executable is available for launch/resume capture. | Omit field for both verbs. |
+| Current Vibepollo implementation commit | software-required | `628a98322045bfb17f35bb215915ca565245468d` | `pending` (source advertises `1`; runtime `/serverinfo` not captured) | `pending` | `pending` | `pending` | Host/client builds and focused contract tests pass, but no connected launch/resume capture was available. | Advertise `1`; accept the field and resolve the peak for both verbs. |
+| Pinned old Moonlight client → current Vibepollo | software-required | `628a98322045bfb17f35bb215915ca565245468d` | `pending` (current source advertises `1`) | `pending` | `pending` | `pending` | No pinned old Moonlight client checkout or executable is available for launch/resume capture. | Omit field for both verbs. |
 | Current Moonlight client → pinned pre-feature Vibepollo | software-required | `f8c4ac2762b351457ee57aef0863655d18b936e4` | `absent` (static source observation; runtime pending) | `pending` | `pending` | `pending` | No current Moonlight client executable or built pinned host is available for the two-verb check. | Omit field for both verbs. |
 | Generic Sunshine baseline | external compatibility | not applicable | `unavailable` | `unavailable` | `unavailable` | `unavailable` | No generic Sunshine host/session is available; compatibility is not inferred from a product name or non-GFE classification. | Omit field unless version `1` is explicitly advertised and both verbs pass. |
 | Generic Apollo baseline | external compatibility | not applicable | `unavailable` | `unavailable` | `unavailable` | `unavailable` | No generic Apollo host/session is available; compatibility is not inferred from a product name or non-GFE classification. | Omit field unless version `1` is explicitly advertised and both verbs pass. |
