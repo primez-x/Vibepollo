@@ -206,8 +206,11 @@ asynchronous launch request is started:
    for the entire candidate open. Open the candidate read-only with
    `CreateFileW`, reject reparse-tagged candidates, and compare the candidate
    handle's `GetFinalPathNameByHandleW()` against the retained directory's
-   final path using case-insensitive ordinal comparison and an exact separator
-   boundary. Reopen the directory after the candidate open and require the
+   final path using a single normalization routine: normalize `\\?\UNC\`
+   and ordinary UNC forms to the same comparison form, strip trailing
+   separators except for a root, and use `CompareStringOrdinal(..., TRUE)`
+   with an exact separator boundary after the directory prefix. Reopen the
+   directory after the candidate open and require the
    volume/file ID to equal the retained handle; if a directory replacement or
    junction race changes that identity, omit the profile. The final-handle
    check is an additional authority check, not a substitute for retaining the
@@ -250,10 +253,11 @@ outside v1 and leaves the launch snapshot unchanged.
 
 `Session` owns a GUI-thread-only RAII probe-window lease from initialization
 through `Session::start()` and stores it in an explicit preparation state
-(`unprepared`, `prepared`, `invalidated`, or `handed-off`). Initialization
-failure destroys the probe window and leaves the state `invalidated`;
-cancelled or repeated starts cannot hand off a stale preparation. The
-collector produces a value-only
+(`unprepared`, `prepared`, `invalidated`, `handed-off`, or `completed`). Each
+preparation has a monotonically increasing generation. Initialization failure,
+cancellation, or display invalidation increments the generation, destroys or
+clears the probe window/snapshot, and prevents handoff. The collector produces
+a value-only
 `client_display_preparation_t` containing the selected-screen identity,
 SDL/DISPLAYCONFIG/DXGI identity tuple, normalized source values, and encoded
 capability string; it contains no `QScreen*`, `SDL_Window*`, or mutable API
@@ -264,11 +268,15 @@ GUI-thread
 probe window. It rechecks the selected screen, calls
 `SDL_GetWindowDisplayIndex()`, re-collects the complete identity/descriptor
 when the mapping changed, and clears the value if validation fails. Only then
-does it atomically move the value-only launch snapshot into the worker
-constructor, destroy the probe window on the GUI thread, and mark the state
-`handed-off`. The worker performs no QScreen, SDL, DISPLAYCONFIG, DXGI, or
-Windows ColorProfile calls. The remaining race after this handoff is a
-documented v1 limitation; no later renegotiation is attempted.
+does it atomically move the value-only launch snapshot and generation into the
+worker constructor, destroy the probe window on the GUI thread, and mark the
+state `handed-off`. Repeated `start()` is rejected or idempotently returns
+without creating a second worker. Worker completion is accepted only when its
+generation equals the handed-off generation and the session remains active;
+late completion after cancellation, stop, or a newer start is discarded. The
+worker performs no QScreen, SDL, DISPLAYCONFIG, DXGI, or Windows ColorProfile
+calls. The remaining race after this handoff is a documented v1 limitation;
+no later renegotiation is attempted.
 
 ## Vibepollo host integration
 
@@ -282,10 +290,12 @@ Moonlight stores the parsed advertisement as the runtime-only
 `NvComputer::clientDisplayCapabilitiesVersion` field. Each server-info parse
 starts from zero, accepts only an integer version of exactly `1`, and assigns
 the parsed value through the existing `NvComputer` refresh/merge path,
-including its explicit changed-field list. The field is reset when the host
-identity changes, is excluded from `NvComputer` persistence and serialized
-equality, and is never reused after a missing, malformed, zero, or unknown
-server-info value.
+including its explicit changed-field list. Copy construction/assignment and
+host-switch construction carry only the current runtime value; a failed or
+missing refresh resets it to zero. The field is reset when the host identity
+changes, is excluded from `NvComputer` persistence and serialized equality,
+and is never reused after a missing, malformed, zero, or unknown server-info
+value.
 
 The host parses `clientDisplayCapabilities` for both launch verbs before
 computing runtime overrides and stores the validated result on
@@ -441,8 +451,9 @@ translation/fallback conventions rather than replacing unrelated translations.
 - Unit-test profile-name resolution from a bare API-returned filename through
   the Windows color directory, including missing, traversal-shaped, oversized,
   and unreadable files. Test canonical directory/file handle comparison with
-  case variants, a prefix-boundary sibling, ADS, UNC/device input, a junction
-  replacement during open, and a reparse-tagged candidate.
+  case variants, a prefix-boundary sibling, ADS, UNC/device input, junction
+  and symlink/reparse replacement during open, directory rename/replacement,
+  and a reparse-tagged candidate; every race must omit the calibrated value.
 - Unit-test serialization for calibrated-plus-EDID, calibrated-only,
   EDID-only, invalid-calibrated-plus-valid-EDID, valid-calibrated-plus-invalid-
   EDID, and no-data cases. Verify each independent member can fail without
@@ -458,7 +469,9 @@ translation/fallback conventions rather than replacing unrelated translations.
   host `/serverinfo` advertisement is ignored by old clients. Verify
   `NvComputer` refreshes version 1 to absent, zero, malformed, and unknown
   version without retaining the previous advertisement, and that the field is
-  excluded from persistence/serialized equality.
+  excluded from persistence/serialized equality. Cover copy/assignment,
+  failed refresh, host switching, and a persistence round trip with explicit
+  zero/nonzero expected values.
 - Verify multi-monitor mapping through the pre-launch QQuickWindow/hidden-test
   window path, including negative-coordinate displays, duplicate/mirrored
   geometry, hidden-window placement mismatch, and unresolved-output omission.
@@ -501,6 +514,11 @@ translation/fallback conventions rather than replacing unrelated translations.
   and application termination performs the eventual clear. Inject failures
   after policy resolution, runtime publication, virtual-display preparation,
   and process launch; assert both map and owner record rollback.
+- Run a repository-wide inventory over `src/**/*.cpp` and `src/**/*.h` for
+  runtime-map mutation, classify every result, and fail the build/check when a
+  feature-key writer is outside the owner manager or low-level definitions.
+  Pair this with stale-generation rejection tests for every inventoried
+  launch, resume, WebRTC, teardown, termination, and live-edit path.
 - Unit-test request logging redaction for the custom capability parameter.
 - Unit-test the common raw-query adapter: it removes the capability field
   before every generic parser/logger and every `nvhttp.cpp` route callback,
