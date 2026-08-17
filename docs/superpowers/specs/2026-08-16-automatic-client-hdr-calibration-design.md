@@ -139,17 +139,28 @@ The host and client share these independent transport limits: a maximum of
 padding), a maximum of 3072 decoded JSON bytes before JSON parsing, and a
 maximum of 12288 raw URL-encoded value bytes before query decoding. The
 host's common HTTP request adapter creates a `request_query_view` before any
-handler runs. The view owns the sanitized query map/string and a bounded
-capability preflight result; it exposes the original request only for path,
-headers, and body, and deliberately exposes no raw-query parser. Every
-`nvhttp.cpp` route callback, including `/serverinfo`, authorization/logging,
-`/launch`, and `/resume`, receives this view. `print_req()` logs only the
-view's sanitized query, and launch/resume read the capability only from the
-preflight result. A static source check rejects direct
-`request->parse_query_string()` calls in those callbacks and verifies every
-route is wrapped by the adapter.
+handler runs. The view is a closed, value-only forwarding surface containing
+method, path, headers, content/body, local and remote endpoints, precomputed
+transport/TLS identity, the sanitized query map/string, and a bounded
+capability preflight result. It contains no raw `Request*`, raw query string,
+query parser, or conversion back to `Request`. Every `nvhttp.cpp` route
+callback, including `/serverinfo`, authorization/logging, `/launch`, and
+`/resume`, receives this view. `print_req()` logs only the view's sanitized
+query, and launch/resume read the capability only from the preflight result. A
+static source check rejects direct `request->parse_query_string()` calls,
+raw-request handler parameters, and raw request/query access outside the
+adapter, and verifies every route is wrapped by the adapter.
 
-The adapter scans the raw `Request::query_string` before copying or
+The same sanitizer/redaction helper is used by the separate configuration HTTP
+surface (`confighttp.cpp`, `confighttp_rtss.cpp`, and
+`confighttp_playnite.cpp`). It adapts that surface's `req_https_t` query source
+into the same value-only view; its web-UI launch path receives an explicitly
+empty client-capability snapshot and cannot opt into the Moonlight capability
+protocol, while its request logger and generic query parser consume the same
+sanitized view. The route-inventory check covers both HTTP surfaces, so a
+capability-shaped secret cannot appear in either logger or parser.
+
+The adapter scans the corresponding raw request query before copying or
 percent-decoding. It removes every case-insensitive
 `clientDisplayCapabilities` field from the query view while retaining all
 other query fields unchanged. A value over 12288 bytes, a repeated capability
@@ -201,24 +212,33 @@ asynchronous launch request is started:
    basename component: reject empty names, separators, drive/device/UNC
    prefixes, `:`, and `.`/`..` components before joining it to the color
    directory. Open the canonical color directory with
-   `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, reject a
-   reparse-tagged directory, and retain that handle plus its volume/file ID
-   for the entire candidate open. Open the candidate read-only with
-   `CreateFileW`, reject reparse-tagged candidates, and compare the candidate
-   handle's `GetFinalPathNameByHandleW()` against the retained directory's
-   final path using a single normalization routine: normalize `\\?\UNC\`
-   and ordinary UNC forms to the same comparison form, strip trailing
-   separators except for a root, and use `CompareStringOrdinal(..., TRUE)`
-   with an exact separator boundary after the directory prefix. Reopen the
-   directory after the candidate open and require the
-   volume/file ID to equal the retained handle; if a directory replacement or
-   junction race changes that identity, omit the profile. The final-handle
-   check is an additional authority check, not a substitute for retaining the
-   directory authority. Reject missing/unreadable files and alternate-stream
-   or UNC/device inputs, then perform one bounded read. Apply the same 32
-   MiB/structural checks as the host and parse MHC2. Free the API-owned name
-   with `LocalFree`. Missing exports, unsupported OS builds, missing profiles,
-   `STANDARD`-only profiles, and parse failures produce no calibrated value.
+   `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, explicitly
+   using share modes that prevent delete/rename while the authority handle is
+   retained. Reject a reparse-tagged directory and retain that handle plus its
+   volume/file ID for the entire candidate open. Enumerate the exact direct
+   child entry through the retained directory handle and record its volume/file
+   ID. Open the candidate read-only with `FILE_FLAG_OPEN_REPARSE_POINT |
+   OPEN_EXISTING` and the same no-delete/rename share policy. Query reparse
+   attributes before reading and require the candidate volume/file ID to match
+   the retained directory's direct-child entry. Compare the candidate handle's
+   `GetFinalPathNameByHandleW()` against the retained directory's final path
+   using a single normalization routine: normalize `\\?\UNC\` and ordinary
+   UNC forms to the same comparison form, strip trailing separators except for
+   a root, and use `CompareStringOrdinal(..., TRUE)` with an exact separator
+   boundary after the directory prefix. Reopening the directory after the
+   candidate open is diagnostic only; the retained-directory child entry plus
+   candidate file-ID match is the containment authority. A replacement,
+   junction, or swap-back race or identity mismatch omits the profile. Reject
+   missing/unreadable files and alternate-stream or UNC/device inputs, then
+   perform one bounded read. The ICC read has a 250 ms wall-clock budget;
+   implement it with a cancellable/overlapped read where required so a slow
+   local file cannot hold the GUI path indefinitely. On timeout, cancel the
+   read and omit only the calibrated value; continue with a valid DXGI
+   fallback. Keep all validated handles live through the read. Apply the same
+   32 MiB/structural checks as the host and parse MHC2. Free the API-owned name
+   with `LocalFree`. Missing
+   exports, unsupported OS builds, missing profiles, `STANDARD`-only profiles,
+   and parse failures produce no calibrated value.
 4. Query the selected DXGI output through
    `IDXGIOutput6::GetDesc1()`. Populate the wire object's `edid` member with
    `source: "dxgi-output"` only when the descriptor is current, uniquely
@@ -244,7 +264,9 @@ phases invalidates the snapshot and sends no capability.
 
 The collector must tolerate missing profiles, displays without HDR support,
 profile parse failures, and Windows API races. It should log the local source
-chosen for the payload without logging the full serialized value.
+chosen for the payload without logging the full serialized value. It records
+collection latency and treats an ICC read exceeding 250 ms as a calibrated
+source failure while preserving any valid DXGI fallback.
 
 The immutable capability snapshot is passed into `NvHTTP::startApp()` before
 the asynchronous connection thread begins. The host receives the data before
@@ -271,12 +293,18 @@ when the mapping changed, and clears the value if validation fails. Only then
 does it atomically move the value-only launch snapshot and generation into the
 worker constructor, destroy the probe window on the GUI thread, and mark the
 state `handed-off`. Repeated `start()` is rejected or idempotently returns
-without creating a second worker. Worker completion is accepted only when its
-generation equals the handed-off generation and the session remains active;
-late completion after cancellation, stop, or a newer start is discarded. The
-worker performs no QScreen, SDL, DISPLAYCONFIG, DXGI, or Windows ColorProfile
-calls. The remaining race after this handoff is a documented v1 limitation;
-no later renegotiation is attempted.
+without creating a second worker. Replace the current worker's direct
+`Session*`, `m_AsyncConnectionSuccess` mutation, and direct success/error side
+effects with a value-only `connection_start_result_t { generation, success,
+error }` signal. A queued GUI-thread slot alone validates generation and active
+state before mutating `Session`, emitting UI signals, or entering `exec`;
+cancellation invalidates the generation before signaling the worker. Worker
+completion is accepted only when its generation equals the handed-off
+generation and the session remains active; late completion after cancellation,
+stop, destruction, or a newer start is discarded. The worker performs no
+QScreen, SDL, DISPLAYCONFIG, DXGI, or Windows ColorProfile calls and cannot
+mutate `Session`. The remaining race after this handoff is a documented v1
+limitation; no later renegotiation is attempted.
 
 ## Vibepollo host integration
 
@@ -290,12 +318,15 @@ Moonlight stores the parsed advertisement as the runtime-only
 `NvComputer::clientDisplayCapabilitiesVersion` field. Each server-info parse
 starts from zero, accepts only an integer version of exactly `1`, and assigns
 the parsed value through the existing `NvComputer` refresh/merge path,
-including its explicit changed-field list. Copy construction/assignment and
-host-switch construction carry only the current runtime value; a failed or
-missing refresh resets it to zero. The field is reset when the host identity
-changes, is excluded from `NvComputer` persistence and serialized equality,
-and is never reused after a missing, malformed, zero, or unknown server-info
-value.
+including an explicit zero for absent, malformed, zero, or unknown values.
+Same-host copy construction and assignment carry the current runtime value;
+default construction, persisted reload, and construction for a replacement
+host identity start at zero. The failed-refresh owner in
+`computermanager.cpp` explicitly invalidates the field under the host lock
+when all-address polling fails, the host goes offline, or an identity
+replacement prevents `NvComputer::update()`; a later successful refresh may
+restore version 1. The field is excluded from `NvComputer` persistence and
+serialized equality and is never reused after an invalidating event.
 
 The host parses `clientDisplayCapabilities` for both launch verbs before
 computing runtime overrides and stores the validated result on
@@ -305,14 +336,17 @@ become a saved host configuration. `clone_for_startup()` must copy the new
 field explicitly.
 
 Client-derived policy uses one canonical effective-HDR resolver shared by
-session construction and peak policy. Its current result is the existing
+session construction and peak policy. Before evaluating it, launch/resume
+builds the prospective runtime map and applies a candidate map value for
+`dd_hdr_request_override` in preference to the previously active global value.
+The resolver then produces exactly the existing
 `rtsp_stream::effective_hdr_requested(const launch_session_t&)` predicate,
 `enable_hdr && !prefer_sdr_10bit && !force_sdr`, after `hdrMode`, per-client
-10-bit-SDR preference, and the Windows `hdr_request_override` force-on/
-force-off/automatic setting have been applied. Launch and resume must resolve
-this seed once before peak selection and pass the same result into the session
-builder and policy; neither may independently reinterpret `hdrMode`. Backend
-display mode must not substitute a different HDR predicate.
+10-bit-SDR preference, and the Windows force-on/force-off/automatic setting
+have been applied. Launch and resume resolve this seed once before peak
+selection and pass the same result into the session builder and policy; neither
+may independently reinterpret `hdrMode` or read a stale global override.
+Backend display mode must not substitute a different HDR predicate.
 
 The effective HDR target helper consumes both the existing explicit settings
 and the new session capability object. It returns the selected peak, source,
@@ -368,24 +402,47 @@ do not retarget global capture/encoder state while another owner is active.
 
 Implement this as a private `hdr_runtime_owner_state`/transaction manager
 shared by HTTP, RTSP, WebRTC, stream teardown, and process termination, using
-the existing `stream_lifecycle_gate` as its single mutation lock. A
-generation-checked lease stores the proposed owner token, prior map, prior
-owner, candidate map, and phase (`provisional`, `awaiting-stream`, `active`,
-or `retained-paused`). An idle launch/resume begins a lease and publishes the
-candidate map; HTTP success leaves it awaiting stream ownership rather than
-committing it. First RTSP/WebRTC ownership publication commits the matching
-generation. Synchronous errors, pending-session cancellation/expiry,
+the existing `stream_lifecycle_gate` as its single mutation lock. The manager
+is the sole production authority for the complete runtime override map:
+low-level whole-map set/clear functions are private to it, and unrelated-key
+edits use manager transactions under the same gate. Every transaction advances
+a monotonic map revision. A generation-checked lease stores the proposed
+owner token, prior map, prior owner, candidate map, owned HDR keys, map
+revision, and phase (`provisional`, `awaiting-stream`, `active`, or
+`retained-paused`).
+
+An idle launch/resume begins a lease and publishes the candidate map; HTTP
+success leaves it awaiting stream ownership rather than committing it. Pending
+joins bind participant tokens to that awaiting-stream cohort. The first
+RTSP/WebRTC ownership publication from any participant commits the cohort's
+matching generation; canceling one participant removes only that participant.
+Rollback is permitted only after the cohort has no pending participants and no
+active publication. When rollback is permitted, it restores only lease-owned
+HDR entries if the generation is current and those entries still equal the
+candidate values; it preserves unrelated current keys and newer explicit HDR
+edits. Synchronous errors, pending-session cancellation/expiry,
 virtual-display failure, and asynchronous stream-start failure roll back the
 matching lease under the gate. A stale rollback cannot overwrite a newer
-generation. A join copies the active owner's target without opening a lease.
-Last-stream teardown marks a still-running application `retained-paused`
-without clearing the map; a later idle request replaces it transactionally.
-`proc_t::terminate()` clears the runtime map and owner state together.
+generation. A join copies the active owner's target without opening a separate
+lease. Last-stream teardown marks a still-running application
+`retained-paused` without clearing the map; a later idle request replaces it
+transactionally. `proc_t::terminate()` clears the runtime map and owner state
+together.
 
-All writes that can change `rtx_hdr_peak_brightness` must use this manager:
-launch/resume, WebRTC's first-capture path, application termination, and live
-RTX HDR edits. An explicit live numeric edit updates owner provenance
-atomically; unrelated runtime keys remain under the existing config API.
+All runtime-map writes must use this manager. In particular, launch/resume,
+WebRTC's first-capture path, application termination, live
+`rtx_hdr_peak_brightness` edits, and unrelated runtime-key edits are manager
+transactions. An explicit live numeric edit updates owner provenance
+atomically. A direct generic whole-map replacement cannot omit or clear the
+owned HDR key without going through an owner transition.
+
+The manager exposes explicit lifecycle transitions for pending-participant
+cancel/expiry, first RTSP or WebRTC publication, stream teardown, paused
+retention, replacement, and process termination. The centralized stream
+finalizer in `stream.cpp:2705-2808` and every RTSP/WebRTC caller of it must
+invoke the matching transition under `stream_lifecycle_gate`; no backend may
+clear or retain the map by changing only its local stream state. This includes
+RTSP timeout, RTSP teardown, WebRTC teardown, and application termination.
 
 ## User interface and documentation
 
@@ -436,6 +493,10 @@ translation/fallback conventions rather than replacing unrelated translations.
   `clientDisplayCapabilities` value before parsing, case-insensitively and for
   every route, regardless of validity or size. Runtime logs identify the
   selected source and fallback reason without exposing raw profile data.
+- Moonlight's verbose URL logging also removes or replaces the complete
+  `clientDisplayCapabilities` query value before logging. The client must not
+  log the serialized base64/JSON capability merely because it contains no raw
+  ICC bytes.
 
 ## Testing and verification
 
@@ -454,6 +515,9 @@ translation/fallback conventions rather than replacing unrelated translations.
   case variants, a prefix-boundary sibling, ADS, UNC/device input, junction
   and symlink/reparse replacement during open, directory rename/replacement,
   and a reparse-tagged candidate; every race must omit the calibrated value.
+  Keep the retained directory and candidate handles live through the read and
+  assert that an injected slow read exceeding 250 ms omits ICC while retaining
+  a valid DXGI fallback.
 - Unit-test serialization for calibrated-plus-EDID, calibrated-only,
   EDID-only, invalid-calibrated-plus-valid-EDID, valid-calibrated-plus-invalid-
   EDID, and no-data cases. Verify each independent member can fail without
@@ -519,13 +583,19 @@ translation/fallback conventions rather than replacing unrelated translations.
   feature-key writer is outside the owner manager or low-level definitions.
   Pair this with stale-generation rejection tests for every inventoried
   launch, resume, WebRTC, teardown, termination, and live-edit path.
+- Exercise the centralized `stream.cpp:2705-2808` finalizer and each RTSP/
+  WebRTC caller for pending expiry, first publication, timeout, teardown,
+  paused retention, replacement, and termination; assert every path invokes a
+  manager transition and preserves map-plus-owner consistency.
 - Unit-test request logging redaction for the custom capability parameter.
 - Unit-test the common raw-query adapter: it removes the capability field
-  before every generic parser/logger and every `nvhttp.cpp` route callback,
+  before every generic parser/logger and every `nvhttp.cpp` or
+  `confighttp*.cpp` route callback,
   preserves unrelated fields, bounds raw value scanning without allocating an
   oversized decoded value, and records invalid/repeated/malformed fields
-  without rejecting the launch. A source check proves every route is wrapped
-  and no callback calls the raw request parser directly.
+  without rejecting the launch. A source check proves every route is wrapped,
+  no callback calls the raw request parser directly, and the configuration
+  web-UI path always receives an empty capability snapshot.
 - Test Sunshine virtual-display creation with a client calibrated peak and
   verify the requested HDR display-reported peak. Test SudoVDA separately and
   verify the explicit runtime-only diagnostic without claiming exact virtual
@@ -545,6 +615,8 @@ numeric override and verify it remains authoritative, including when the host
 profile's MHC2 peak is unreadable. Run the same matrix against SudoVDA and
 record whether the backend provides exact virtual-display inheritance or the
 documented runtime-only fallback.
+Enable Moonlight verbose logging during one launch/resume and assert the
+serialized capability value is absent from the logged URL.
 
 ## Expected result
 
