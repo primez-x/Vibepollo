@@ -134,14 +134,19 @@ whole nit before applying the existing `400..2000` effective target clamp.
 Unknown fields are ignored so the contract can grow without breaking older
 Vibepollo builds.
 
-The host must impose a small maximum decoded payload size, reject unknown
-versions without failing launch, reject non-finite values, and validate strict
-JSON types before using any field. The encoded value is unpadded URL-safe
-base64 (`A-Z`, `a-z`, `0-9`, `-`, `_`); optional terminal `=` padding is
-accepted, but whitespace, invalid alphabet characters, excess padding, and
-payloads over 4096 encoded bytes are rejected. A malformed or unsupported
-payload is equivalent to no client capability data and must not prevent the
-stream from starting.
+The host and client share these independent transport limits: a maximum of
+4096 bytes for the URL-decoded base64 value (including optional terminal
+padding), a maximum of 3072 decoded JSON bytes before JSON parsing, and a
+maximum of 12288 raw URL-encoded value bytes before query decoding. The
+sender rejects the first limit before request construction; the host enforces
+the raw limit at query extraction, the decoded-base64 limit before decoding,
+and the decoded-JSON limit before parsing. The encoded value is unpadded
+URL-safe base64 (`A-Z`, `a-z`, `0-9`, `-`, `_`); optional terminal `=` padding
+is accepted, but whitespace, invalid alphabet characters, and excess padding
+are rejected. The host also rejects unknown versions without failing launch,
+rejects non-finite values, and validates strict JSON types before using any
+field. A malformed or unsupported payload is equivalent to no client
+capability data and must not prevent the stream from starting.
 
 The client sends this parameter only for an HDR-capable Windows Desktop
 session, only for non-GFE hosts, and for both `launch` and `resume` requests.
@@ -162,8 +167,10 @@ asynchronous launch request is started:
    launch request, so it must not be queried from the launch worker.
 2. Map that display's GDI/DXGI identity to one active `DISPLAYCONFIG` path,
    reusing the existing mapping approach in `d3d11va.cpp`. Retain the complete
-   identity tuple. The GDI source lookup uses `path.sourceInfo.adapterId` and
-   `path.sourceInfo.id`, while the ColorProfile APIs receive
+   identity tuple: SDL display index and DXGI adapter/output ordinal, GDI
+   source name, source adapter LUID/source ID, target adapter LUID/target ID,
+   active-path flags, and target availability. The GDI source lookup uses
+   `path.sourceInfo.adapterId` and `path.sourceInfo.id`, while the ColorProfile APIs receive
    `path.targetInfo.adapterId` as `targetAdapterID` plus
    `path.sourceInfo.id` as `sourceID`. Dynamically resolve the Windows
    ColorProfile APIs from `mscms.dll` so older supported Windows versions
@@ -173,9 +180,12 @@ asynchronous launch request is started:
    `CPST_EXTENDED_DISPLAY_COLOR_MODE`. The returned profile name is resolved
    through the Windows color directory (`GetColorDirectoryW` or an equivalent
    canonical helper), constrained to that directory, and then read only
-   locally. Reject empty, absolute, traversal-shaped, missing, or unreadable
-   names before applying the same 32 MiB/structural checks as the host and
-   parsing MHC2. Free the API-owned name with `LocalFree`. Missing exports,
+   locally. Resolve the canonical directory and final file path with
+   case-insensitive containment, reject UNC/device/alternate-stream,
+   absolute, traversal-shaped, missing, unreadable, or reparse-point escapes,
+   and verify the opened handle's final path remains inside the directory.
+   Apply the same 32 MiB/structural checks as the host and parse MHC2. Free
+   the API-owned name with `LocalFree`. Missing exports,
    unsupported OS builds, missing profiles, `STANDARD`-only profiles, and
    parse failures produce no calibrated value.
 4. Query the selected DXGI output through
@@ -192,9 +202,14 @@ asynchronous launch request is started:
    bytes.
 
 Capture the selected-display identity before profile/DXGI reads and revalidate
-the QScreen-to-SDL index plus the complete DISPLAYCONFIG/DXGI identity tuple
-afterward. A hotplug, clone transition, window relocation, or output change
-between those phases invalidates the snapshot and sends no capability.
+the QScreen-to-SDL index plus every captured DISPLAYCONFIG/DXGI identity field
+afterward: adapter/output ordinal, GDI name, source/target LUIDs and IDs,
+active flags, target availability, output device name, desktop coordinates,
+`AttachedToDesktop`, `ColorSpace`, and the luminance fields used by the
+snapshot. Windows exposes no descriptor generation number here; a successful
+requery with exact identity/descriptor equality is the currentness check. A
+hotplug, clone transition, window relocation, or output change between those
+phases invalidates the snapshot and sends no capability.
 
 The collector must tolerate missing profiles, displays without HDR support,
 profile parse failures, and Windows API races. It should log the local source
@@ -214,6 +229,15 @@ computing runtime overrides and stores the validated result on
 become a saved host configuration. `clone_for_startup()` must copy the new
 field explicitly.
 
+Client-derived policy uses the existing authoritative
+`rtsp_stream::effective_hdr_requested(const launch_session_t&)` predicate,
+which is `enable_hdr && !prefer_sdr_10bit && !force_sdr`. The predicate is
+evaluated after `hdrMode`, per-client 10-bit-SDR preference, and the Windows
+`hdr_request_override` force-on/force-off/automatic setting have been applied
+in the existing launch setup, and before client peak selection in both launch
+and resume. Backend display mode must not substitute a different HDR
+predicate.
+
 The effective HDR target helper consumes both the existing explicit settings
 and the new session capability object. It returns the selected peak, source,
 and fallback reason. Runtime configuration override creation uses the
@@ -226,7 +250,10 @@ The selected effective peak must be available before:
 
 - Sunshine temporary-display creation, where the existing
   `hdr_max_luminance_nits` request receives the effective target;
-- RTX HDR runtime initialization; and
+- RTX HDR runtime initialization, where the existing
+  `rtx_hdr_peak_brightness` runtime key becomes
+  `config::video.rtx_hdr.peak_brightness` and is copied into the RTSP session
+  peak; and
 - any other backend that explicitly accepts the same target field.
 
 The log source should distinguish at least `explicit-override`,
@@ -263,6 +290,19 @@ that target, while application termination performs the existing eventual
 clear. Per-session capability fields may still be retained for logs, but they
 do not retarget global capture/encoder state while another owner is active.
 
+Implement this as a private `hdr_runtime_owner_state` adjacent to the existing
+HTTP lifecycle state, protected by the same route gate. It stores an owner
+token/generation, phase (`provisional`, `awaiting-stream`, `active`, or
+`retained-paused`), the prior runtime-map snapshot, and the resolved target.
+An idle launch/resume begins a transaction and publishes the candidate map;
+the HTTP success response moves it to `awaiting-stream`, first stream-session
+activation commits `active`, and any request, virtual-display, or stream-start
+failure restores both the prior map and owner record. A join copies the active
+owner's target without opening a transaction. Last-stream teardown marks a
+still-running application `retained-paused` without clearing the map; a later
+idle request replaces it transactionally. `proc_t::terminate()` clears the
+runtime map and owner state together.
+
 ## User interface and documentation
 
 The new and legacy client settings views should make the policy explicit:
@@ -294,8 +334,9 @@ translation/fallback conventions rather than replacing unrelated translations.
 - The pinned pre-feature Vibepollo baseline
   `f8c4ac2762b351457ee57aef0863655d18b936e4` parses launch/resume query
   parameters as a map and reads known keys without rejecting unknown keys.
-  New clients may therefore send this optional field to that host family; no
-  deferred version-gate branch is part of v1. GFE remains explicitly excluded.
+  This exact baseline is the v1 compatibility guarantee; the plan does not
+  generalize that result to unverified deployed versions. GFE remains
+  explicitly excluded.
 - No client-supplied value is persisted or treated as trusted configuration.
 - No client-supplied path is opened by the host.
 - Payload size, numeric ranges, and JSON structure are bounded before use.
@@ -318,7 +359,12 @@ translation/fallback conventions rather than replacing unrelated translations.
   the Windows color directory, including missing, traversal-shaped, oversized,
   and unreadable files.
 - Unit-test serialization for calibrated-plus-EDID, calibrated-only,
-  EDID-only, and no-data cases.
+  EDID-only, invalid-calibrated-plus-valid-EDID, valid-calibrated-plus-invalid-
+  EDID, and no-data cases. Verify each independent member can fail without
+  suppressing the other valid source.
+- Unit-test the 4096-byte URL-decoded base64, 3072-byte decoded JSON, and
+  12288-byte raw URL-encoded boundaries, including optional padding and
+  percent expansion.
 - Verify the launch request includes the new parameter before both launch and
   resume calls for non-GFE HDR sessions, omits it for GFE/SDR sessions, and
   retains the existing HDR query fields.
@@ -330,7 +376,8 @@ translation/fallback conventions rather than replacing unrelated translations.
   fallback.
 - Verify a post-read display-identity mutation, hidden-window relocation, or
   clone/hotplug transition invalidates the snapshot rather than reporting the
-  wrong output.
+  wrong output. Mutate each captured source/target/DXGI identity and descriptor
+  field independently.
 
 ### Vibepollo
 
@@ -343,6 +390,9 @@ translation/fallback conventions rather than replacing unrelated translations.
 - Unit-test that client-derived values are ignored for SDR launch and resume
   requests on both idle-owner and active-join paths, while explicit host
   overrides retain their existing semantics.
+- Assert the exact `enable_hdr && !prefer_sdr_10bit && !force_sdr` predicate
+  for contradictory `hdrMode`, client preference, and force-on/force-off
+  combinations on launch and resume.
 - Unit-test runtime override creation to ensure the selected peak reaches the
   existing `rtx_hdr_peak_brightness` field.
 - Unit-test that automatic client data does not trigger host physical ICC
@@ -351,12 +401,17 @@ translation/fallback conventions rather than replacing unrelated translations.
   cannot retarget process-global runtime state.
 - Unit-test paused-application ownership: a disconnected owner's retained map
   is restored after a failed replacement, a successful idle resume replaces it,
-  and application termination performs the eventual clear.
+  and application termination performs the eventual clear. Inject failures
+  after policy resolution, runtime publication, virtual-display preparation,
+  and process launch; assert both map and owner record rollback.
 - Unit-test request logging redaction for the custom capability parameter.
 - Test Sunshine virtual-display creation with a client calibrated peak and
   verify the requested HDR display-reported peak. Test SudoVDA separately and
   verify the explicit runtime-only diagnostic without claiming exact virtual
-  display inheritance.
+  display inheritance. Assert the resolved value reaches the existing
+  `rtx_hdr_peak_brightness`/RTSP RTX HDR consumer while the SudoVDA
+  `createVirtualDisplay` path receives no new luminance argument and continues
+  to discard only its existing `hdr_requested` parameter.
 
 ### End-to-end Windows smoke test
 
