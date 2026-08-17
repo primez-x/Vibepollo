@@ -48,6 +48,7 @@ environment or hardware needed for the row is not present; it is not a pass.
 
 - Host staged build: `ninja sunshine` completed successfully with the Windows
   toolchain.
+- Host full CTest: 53/53 passed after building `tests/all`.
 - Host focused CTest: 8/8 passed — client capability parser, peak policy,
   runtime owner, request policy, request-view redaction, RTSP startup snapshot,
   locale consistency, and the static writer/feature-key/route inventory.
