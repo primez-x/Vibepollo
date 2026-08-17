@@ -138,18 +138,27 @@ The host and client share these independent transport limits: a maximum of
 4096 bytes for the URL-decoded base64 value (including optional terminal
 padding), a maximum of 3072 decoded JSON bytes before JSON parsing, and a
 maximum of 12288 raw URL-encoded value bytes before query decoding. The
-host's common HTTP request adapter scans the raw `Request::query_string`
-before any generic `parse_query_string()` call. It removes every
-case-insensitive `clientDisplayCapabilities` field from the query view used by
-handlers and logging, while retaining all other query fields unchanged. The
-adapter counts raw value bytes before copying or percent-decoding; a value over
-12288 bytes, a repeated capability field, or malformed percent encoding marks
-only the capability as invalid and leaves the rest of the request launchable.
-A valid field is percent-decoded into a bounded buffer, then the
-decoded-base64 and decoded-JSON limits are enforced before their respective
-operations. The original raw value is never passed to a logger or generic
-query map. The sender rejects the first limit before request construction. The
-encoded value is unpadded
+host's common HTTP request adapter creates a `request_query_view` before any
+handler runs. The view owns the sanitized query map/string and a bounded
+capability preflight result; it exposes the original request only for path,
+headers, and body, and deliberately exposes no raw-query parser. Every
+`nvhttp.cpp` route callback, including `/serverinfo`, authorization/logging,
+`/launch`, and `/resume`, receives this view. `print_req()` logs only the
+view's sanitized query, and launch/resume read the capability only from the
+preflight result. A static source check rejects direct
+`request->parse_query_string()` calls in those callbacks and verifies every
+route is wrapped by the adapter.
+
+The adapter scans the raw `Request::query_string` before copying or
+percent-decoding. It removes every case-insensitive
+`clientDisplayCapabilities` field from the query view while retaining all
+other query fields unchanged. A value over 12288 bytes, a repeated capability
+field, or malformed percent encoding marks only the capability as invalid and
+leaves the rest of the request launchable. A valid field is percent-decoded
+into a bounded buffer, then the decoded-base64 and decoded-JSON limits are
+enforced before their respective operations. The original raw value is never
+passed to a logger or generic query map. The sender rejects the first limit
+before request construction. The encoded value is unpadded
 URL-safe base64 (`A-Z`, `a-z`, `0-9`, `-`, `_`); optional terminal `=` padding
 is accepted, but whitespace, invalid alphabet characters, and excess padding
 are rejected. The host also rejects unknown versions without failing launch,
@@ -191,17 +200,22 @@ asynchronous launch request is started:
    `CPST_EXTENDED_DISPLAY_COLOR_MODE`. The returned profile name must be one
    basename component: reject empty names, separators, drive/device/UNC
    prefixes, `:`, and `.`/`..` components before joining it to the color
-   directory. Canonicalize the color directory from a directory handle, open
-   the candidate read-only with `CreateFileW`, reject reparse-tagged files,
-   and compare the opened handle's `GetFinalPathNameByHandleW()` against the
-   canonical directory with case-insensitive ordinal comparison and an exact
-   separator boundary. This handle-based check remains authoritative if a
-   junction or file is replaced between path construction and open. Reject
-   missing/unreadable files and alternate-stream or UNC/device inputs, then
-   perform one bounded read. Apply the same 32 MiB/structural checks as the
-   host and parse MHC2. Free the API-owned name with `LocalFree`. Missing
-   exports, unsupported OS builds, missing profiles, `STANDARD`-only profiles,
-   and parse failures produce no calibrated value.
+   directory. Open the canonical color directory with
+   `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, reject a
+   reparse-tagged directory, and retain that handle plus its volume/file ID
+   for the entire candidate open. Open the candidate read-only with
+   `CreateFileW`, reject reparse-tagged candidates, and compare the candidate
+   handle's `GetFinalPathNameByHandleW()` against the retained directory's
+   final path using case-insensitive ordinal comparison and an exact separator
+   boundary. Reopen the directory after the candidate open and require the
+   volume/file ID to equal the retained handle; if a directory replacement or
+   junction race changes that identity, omit the profile. The final-handle
+   check is an additional authority check, not a substitute for retaining the
+   directory authority. Reject missing/unreadable files and alternate-stream
+   or UNC/device inputs, then perform one bounded read. Apply the same 32
+   MiB/structural checks as the host and parse MHC2. Free the API-owned name
+   with `LocalFree`. Missing exports, unsupported OS builds, missing profiles,
+   `STANDARD`-only profiles, and parse failures produce no calibrated value.
 4. Query the selected DXGI output through
    `IDXGIOutput6::GetDesc1()`. Populate the wire object's `edid` member with
    `source: "dxgi-output"` only when the descriptor is current, uniquely
@@ -235,18 +249,24 @@ virtual-display creation and capture preparation. A later display move is
 outside v1 and leaves the launch snapshot unchanged.
 
 `Session` owns a GUI-thread-only RAII probe-window lease from initialization
-through `Session::start()`. The collector produces a value-only
+through `Session::start()` and stores it in an explicit preparation state
+(`unprepared`, `prepared`, `invalidated`, or `handed-off`). Initialization
+failure destroys the probe window and leaves the state `invalidated`;
+cancelled or repeated starts cannot hand off a stale preparation. The
+collector produces a value-only
 `client_display_preparation_t` containing the selected-screen identity,
 SDL/DISPLAYCONFIG/DXGI identity tuple, normalized source values, and encoded
 capability string; it contains no `QScreen*`, `SDL_Window*`, or mutable API
-handle that a worker may access. Immediately before constructing
-`AsyncConnectionStartThread`, `Session::start()` calls the GUI-thread
+handle that a worker may access. `Session::start()` is GUI-thread-only and,
+immediately before constructing `AsyncConnectionStartThread`, calls the
+GUI-thread
 `finalize_client_display_preparation()` while retaining or recreating that
 probe window. It rechecks the selected screen, calls
 `SDL_GetWindowDisplayIndex()`, re-collects the complete identity/descriptor
 when the mapping changed, and clears the value if validation fails. Only then
-does it destroy the probe window and copy the value-only launch snapshot into
-the worker. The worker performs no QScreen, SDL, DISPLAYCONFIG, DXGI, or
+does it atomically move the value-only launch snapshot into the worker
+constructor, destroy the probe window on the GUI thread, and mark the state
+`handed-off`. The worker performs no QScreen, SDL, DISPLAYCONFIG, DXGI, or
 Windows ColorProfile calls. The remaining race after this handoff is a
 documented v1 limitation; no later renegotiation is attempted.
 
@@ -257,6 +277,15 @@ existing `/serverinfo` XML. Old Moonlight clients ignore this additional
 element. The client uses this explicit advertisement to decide whether to
 send `clientDisplayCapabilities`; it does not infer support from a generic
 non-GFE classification, `appVersion`, or a guessed server family.
+
+Moonlight stores the parsed advertisement as the runtime-only
+`NvComputer::clientDisplayCapabilitiesVersion` field. Each server-info parse
+starts from zero, accepts only an integer version of exactly `1`, and assigns
+the parsed value through the existing `NvComputer` refresh/merge path,
+including its explicit changed-field list. The field is reset when the host
+identity changes, is excluded from `NvComputer` persistence and serialized
+equality, and is never reused after a missing, malformed, zero, or unknown
+server-info value.
 
 The host parses `clientDisplayCapabilities` for both launch verbs before
 computing runtime overrides and stores the validated result on
@@ -426,7 +455,10 @@ translation/fallback conventions rather than replacing unrelated translations.
 - Verify the launch request includes the new parameter before both launch and
   resume calls only when the host advertises version 1, omits it for GFE/SDR/
   unadvertised hosts, and retains the existing HDR query fields. Verify the
-  host `/serverinfo` advertisement is ignored by old clients.
+  host `/serverinfo` advertisement is ignored by old clients. Verify
+  `NvComputer` refreshes version 1 to absent, zero, malformed, and unknown
+  version without retaining the previous advertisement, and that the field is
+  excluded from persistence/serialized equality.
 - Verify multi-monitor mapping through the pre-launch QQuickWindow/hidden-test
   window path, including negative-coordinate displays, duplicate/mirrored
   geometry, hidden-window placement mismatch, and unresolved-output omission.
@@ -439,8 +471,10 @@ translation/fallback conventions rather than replacing unrelated translations.
   field independently.
 - Verify the GUI-owned probe-window lease survives initialization until
   `Session::start()`, final validation runs on the GUI thread, the worker
-  receives only an immutable value snapshot, and a screen mutation between
-  initialization and worker creation causes recollection or omission.
+  receives only an immutable value snapshot, and initialization failure,
+  cancellation, repeated finalization, probe-window recreation, or a screen
+  mutation between initialization and worker creation causes invalidation,
+  recollection, or omission.
 
 ### Vibepollo
 
@@ -469,9 +503,11 @@ translation/fallback conventions rather than replacing unrelated translations.
   and process launch; assert both map and owner record rollback.
 - Unit-test request logging redaction for the custom capability parameter.
 - Unit-test the common raw-query adapter: it removes the capability field
-  before every generic parser/logger, preserves unrelated fields, bounds raw
-  value scanning without allocating an oversized decoded value, and records
-  invalid/repeated/malformed fields without rejecting the launch.
+  before every generic parser/logger and every `nvhttp.cpp` route callback,
+  preserves unrelated fields, bounds raw value scanning without allocating an
+  oversized decoded value, and records invalid/repeated/malformed fields
+  without rejecting the launch. A source check proves every route is wrapped
+  and no callback calls the raw request parser directly.
 - Test Sunshine virtual-display creation with a client calibrated peak and
   verify the requested HDR display-reported peak. Test SudoVDA separately and
   verify the explicit runtime-only diagnostic without claiming exact virtual
