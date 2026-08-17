@@ -138,9 +138,18 @@ The host and client share these independent transport limits: a maximum of
 4096 bytes for the URL-decoded base64 value (including optional terminal
 padding), a maximum of 3072 decoded JSON bytes before JSON parsing, and a
 maximum of 12288 raw URL-encoded value bytes before query decoding. The
-sender rejects the first limit before request construction; the host enforces
-the raw limit at query extraction, the decoded-base64 limit before decoding,
-and the decoded-JSON limit before parsing. The encoded value is unpadded
+host's common HTTP request adapter scans the raw `Request::query_string`
+before any generic `parse_query_string()` call. It removes every
+case-insensitive `clientDisplayCapabilities` field from the query view used by
+handlers and logging, while retaining all other query fields unchanged. The
+adapter counts raw value bytes before copying or percent-decoding; a value over
+12288 bytes, a repeated capability field, or malformed percent encoding marks
+only the capability as invalid and leaves the rest of the request launchable.
+A valid field is percent-decoded into a bounded buffer, then the
+decoded-base64 and decoded-JSON limits are enforced before their respective
+operations. The original raw value is never passed to a logger or generic
+query map. The sender rejects the first limit before request construction. The
+encoded value is unpadded
 URL-safe base64 (`A-Z`, `a-z`, `0-9`, `-`, `_`); optional terminal `=` padding
 is accepted, but whitespace, invalid alphabet characters, and excess padding
 are rejected. The host also rejects unknown versions without failing launch,
@@ -148,10 +157,12 @@ rejects non-finite values, and validates strict JSON types before using any
 field. A malformed or unsupported payload is equivalent to no client
 capability data and must not prevent the stream from starting.
 
-The client sends this parameter only for an HDR-capable Windows Desktop
-session, only for non-GFE hosts, and for both `launch` and `resume` requests.
-If the output cannot be resolved, it sends no capability payload rather than
-risking data from the wrong monitor.
+The host advertises support with `ClientDisplayCapabilitiesVersion=1` in
+`/serverinfo`. The client sends this parameter only when that capability is
+advertised, for an HDR-capable Windows Desktop session, and for both `launch`
+and `resume` requests. GFE and servers that do not advertise the capability
+receive no new parameter. If the output cannot be resolved, it sends no
+capability payload rather than risking data from the wrong monitor.
 
 ## Windows client collection
 
@@ -177,18 +188,20 @@ asynchronous launch request is started:
    remain loadable when those exports are unavailable.
 3. Query `ColorProfileGetDisplayUserScope()` and
    `ColorProfileGetDisplayDefault()` with `CPT_ICC` and
-   `CPST_EXTENDED_DISPLAY_COLOR_MODE`. The returned profile name is resolved
-   through the Windows color directory (`GetColorDirectoryW` or an equivalent
-   canonical helper), constrained to that directory, and then read only
-   locally. Resolve the canonical directory and final file path with
-   case-insensitive containment, reject UNC/device/alternate-stream,
-   absolute, traversal-shaped, missing, unreadable, or reparse-point escapes,
-   then open read-only with `CreateFileW`, verify the handle's
-   `GetFinalPathNameByHandleW` remains inside the directory, and perform one
-   bounded read. Apply the same 32 MiB/structural checks as the host and parse
-   MHC2. Free the API-owned name with `LocalFree`. Missing exports,
-   unsupported OS builds, missing profiles, `STANDARD`-only profiles, and
-   parse failures produce no calibrated value.
+   `CPST_EXTENDED_DISPLAY_COLOR_MODE`. The returned profile name must be one
+   basename component: reject empty names, separators, drive/device/UNC
+   prefixes, `:`, and `.`/`..` components before joining it to the color
+   directory. Canonicalize the color directory from a directory handle, open
+   the candidate read-only with `CreateFileW`, reject reparse-tagged files,
+   and compare the opened handle's `GetFinalPathNameByHandleW()` against the
+   canonical directory with case-insensitive ordinal comparison and an exact
+   separator boundary. This handle-based check remains authoritative if a
+   junction or file is replaced between path construction and open. Reject
+   missing/unreadable files and alternate-stream or UNC/device inputs, then
+   perform one bounded read. Apply the same 32 MiB/structural checks as the
+   host and parse MHC2. Free the API-owned name with `LocalFree`. Missing
+   exports, unsupported OS builds, missing profiles, `STANDARD`-only profiles,
+   and parse failures produce no calibrated value.
 4. Query the selected DXGI output through
    `IDXGIOutput6::GetDesc1()`. Populate the wire object's `edid` member with
    `source: "dxgi-output"` only when the descriptor is current, uniquely
@@ -221,16 +234,29 @@ the asynchronous connection thread begins. The host receives the data before
 virtual-display creation and capture preparation. A later display move is
 outside v1 and leaves the launch snapshot unchanged.
 
-Because the initialization test window is destroyed before `Session::start()`
-starts `AsyncConnectionStartThread`, the client performs one final
-GUI-thread display-identity validation immediately before that handoff,
-retaining or recreating the hidden test window as needed. A changed screen,
-SDL/DXGI binding, or display descriptor clears the snapshot (and may recollect
-from the newly selected display) before `NvHTTP::startApp()`. The remaining
-race after the worker handoff is a documented v1 limitation; no later
-renegotiation is attempted.
+`Session` owns a GUI-thread-only RAII probe-window lease from initialization
+through `Session::start()`. The collector produces a value-only
+`client_display_preparation_t` containing the selected-screen identity,
+SDL/DISPLAYCONFIG/DXGI identity tuple, normalized source values, and encoded
+capability string; it contains no `QScreen*`, `SDL_Window*`, or mutable API
+handle that a worker may access. Immediately before constructing
+`AsyncConnectionStartThread`, `Session::start()` calls the GUI-thread
+`finalize_client_display_preparation()` while retaining or recreating that
+probe window. It rechecks the selected screen, calls
+`SDL_GetWindowDisplayIndex()`, re-collects the complete identity/descriptor
+when the mapping changed, and clears the value if validation fails. Only then
+does it destroy the probe window and copy the value-only launch snapshot into
+the worker. The worker performs no QScreen, SDL, DISPLAYCONFIG, DXGI, or
+Windows ColorProfile calls. The remaining race after this handoff is a
+documented v1 limitation; no later renegotiation is attempted.
 
 ## Vibepollo host integration
+
+New Vibepollo builds advertise `ClientDisplayCapabilitiesVersion=1` in the
+existing `/serverinfo` XML. Old Moonlight clients ignore this additional
+element. The client uses this explicit advertisement to decide whether to
+send `clientDisplayCapabilities`; it does not infer support from a generic
+non-GFE classification, `appVersion`, or a guessed server family.
 
 The host parses `clientDisplayCapabilities` for both launch verbs before
 computing runtime overrides and stores the validated result on
@@ -352,10 +378,18 @@ translation/fallback conventions rather than replacing unrelated translations.
   GFE request shape remains unchanged.
 - The pinned pre-feature Vibepollo baseline
   `f8c4ac2762b351457ee57aef0863655d18b936e4` parses launch/resume query
-  parameters as a map and reads known keys without rejecting unknown keys.
-  This exact baseline is the v1 compatibility guarantee; the plan does not
-  generalize that result to unverified deployed versions. GFE remains
-  explicitly excluded.
+  parameters as a map and reads known keys without rejecting unknown keys, but
+  it does not advertise `ClientDisplayCapabilitiesVersion`. The new client
+  therefore omits the field when talking to that baseline. This exact
+  old-host behavior and the current Vibepollo advertisement are the v1
+  compatibility guarantee; generic Sunshine/Apollo servers are not assumed to
+  accept the field merely because they are non-GFE.
+- The sender-side gate is the advertised version, not a heuristic based on
+  `isNvidiaServerSoftware`, `appVersion`, or an unknown server family. A host
+  must advertise version 1 before the client constructs the new query field.
+  A compatibility matrix records the exact server-info advertisement and both
+  launch/resume results for each supported host build before the sender gate
+  is enabled for that build.
 - No client-supplied value is persisted or treated as trusted configuration.
 - No client-supplied path is opened by the host.
 - Payload size, numeric ranges, and JSON structure are bounded before use.
@@ -377,17 +411,22 @@ translation/fallback conventions rather than replacing unrelated translations.
   `client-dxgi-output`; `edid` is only the v1 wire member name.
 - Unit-test profile-name resolution from a bare API-returned filename through
   the Windows color directory, including missing, traversal-shaped, oversized,
-  and unreadable files.
+  and unreadable files. Test canonical directory/file handle comparison with
+  case variants, a prefix-boundary sibling, ADS, UNC/device input, a junction
+  replacement during open, and a reparse-tagged candidate.
 - Unit-test serialization for calibrated-plus-EDID, calibrated-only,
   EDID-only, invalid-calibrated-plus-valid-EDID, valid-calibrated-plus-invalid-
   EDID, and no-data cases. Verify each independent member can fail without
   suppressing the other valid source.
 - Unit-test the 4096-byte URL-decoded base64, 3072-byte decoded JSON, and
   12288-byte raw URL-encoded boundaries, including optional padding and
-  percent expansion.
+  percent expansion. Exercise raw values of exactly 12288 and 12289 bytes,
+  mixed-case and percent-encoded field names, repeated fields, malformed
+  percent sequences, and path-shaped values before generic query parsing.
 - Verify the launch request includes the new parameter before both launch and
-  resume calls for non-GFE HDR sessions, omits it for GFE/SDR sessions, and
-  retains the existing HDR query fields.
+  resume calls only when the host advertises version 1, omits it for GFE/SDR/
+  unadvertised hosts, and retains the existing HDR query fields. Verify the
+  host `/serverinfo` advertisement is ignored by old clients.
 - Verify multi-monitor mapping through the pre-launch QQuickWindow/hidden-test
   window path, including negative-coordinate displays, duplicate/mirrored
   geometry, hidden-window placement mismatch, and unresolved-output omission.
@@ -398,6 +437,10 @@ translation/fallback conventions rather than replacing unrelated translations.
   clone/hotplug transition invalidates the snapshot rather than reporting the
   wrong output. Mutate each captured source/target/DXGI identity and descriptor
   field independently.
+- Verify the GUI-owned probe-window lease survives initialization until
+  `Session::start()`, final validation runs on the GUI thread, the worker
+  receives only an immutable value snapshot, and a screen mutation between
+  initialization and worker creation causes recollection or omission.
 
 ### Vibepollo
 
@@ -425,6 +468,10 @@ translation/fallback conventions rather than replacing unrelated translations.
   after policy resolution, runtime publication, virtual-display preparation,
   and process launch; assert both map and owner record rollback.
 - Unit-test request logging redaction for the custom capability parameter.
+- Unit-test the common raw-query adapter: it removes the capability field
+  before every generic parser/logger, preserves unrelated fields, bounds raw
+  value scanning without allocating an oversized decoded value, and records
+  invalid/repeated/malformed fields without rejecting the launch.
 - Test Sunshine virtual-display creation with a client calibrated peak and
   verify the requested HDR display-reported peak. Test SudoVDA separately and
   verify the explicit runtime-only diagnostic without claiming exact virtual
