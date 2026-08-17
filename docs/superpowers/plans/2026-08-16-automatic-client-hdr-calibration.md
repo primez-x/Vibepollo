@@ -23,9 +23,11 @@
   4. The client’s DXGI/EDID-derived peak.
   5. The existing global/default behavior.
 - A selected but missing, unreadable, malformed, or unsupported host profile suppresses automatic client values and retains the existing global fallback. It must never silently fall through to a client calibration.
+- Client-derived values are usable only when the host's final effective HDR request is enabled; host policy must reject them for SDR launch/resume even if the sender supplied a valid payload.
 - A first active session owns process-global runtime HDR configuration. Joining launch/resume requests inherit the active target and cannot retarget it with a different client peak.
 - Use the existing launch_request_mutex and stream_lifecycle_gate as the owner-selection seam. Do not introduce a second unsynchronized process-global HDR owner.
 - Capability collection must fail closed when the selected QScreen cannot be mapped uniquely to one SDL/DXGI output or when the hidden window lands on a different output. The existing display-0 rendering fallback must never become a reported capability.
+- The Windows display identity is a complete tuple: source adapter LUID/source ID for GDI lookup, target adapter LUID/source ID for ColorProfile APIs, and the mapped DXGI adapter/output identity.
 - Client capability parsing and transport failures are fail-soft: old clients and malformed values must still launch with existing behavior.
 - The capability field must be bounded before decoding/parsing, URL-safe, redacted from verbose request logs, and sent on both /launch and /resume only for non-GFE hosts.
 - Add focused automated tests for every pure parser/policy/clone contract. Add Windows collection and host-driver behavior to the end-to-end checklist where the environment is required.
@@ -97,7 +99,7 @@
 1. Add a small host-owned value type with optional calibrated and DXGI display-reported peak fields, source/version metadata, and a parse result that distinguishes absent, invalid, unsupported, and valid input for logging without exposing raw input.
 2. Decode base64url with -/_, accept optional terminal padding, reject invalid characters/padding/oversized encoded input, then parse strict JSON types with nlohmann JSON.
 3. Accept only version == 1, platform == "windows-desktop", known source labels, finite numeric peaks in 1..100000 nits, and the documented object shape. Accept fractional JSON numbers and round them to the nearest whole nit using the same rule as the client; clients emit normalized integers. Treat invalid values as an ignored capability rather than an HTTP error.
-4. Add a policy function with explicit inputs for numeric override, manual-profile-selected state, manual-profile peak validity, client capabilities, and the existing global fallback. Return both the selected peak/source and an explanation enum suitable for diagnostics.
+4. Add a policy function with explicit inputs for final effective HDR request, numeric override, manual-profile-selected state, manual-profile peak validity, client capabilities, and the existing global fallback. Return both the selected peak/source and an explanation enum suitable for diagnostics. Client-derived values are ignored whenever final effective HDR is false.
 5. Apply the existing runtime range clamp only at the existing runtime boundary (400..2000 nits) so transport validation and host behavior remain independently testable.
 6. Ensure the policy does not use client values when any non-empty manual profile is selected, even if profile parsing fails.
 
@@ -122,8 +124,8 @@
 3. Extract and validate clientDisplayCapabilities immediately after query extraction for both handlers, before either runtime-override block. Enforce the encoded-size limit before decoding.
 4. Pass the same immutable parsed snapshot into every make_launch_session_from_snapshot call path used by launch and resume. Do not let resume's later app-context seeding reconstruct or overwrite the request snapshot.
 5. In launch, merge app/client numeric overrides, evaluate the policy, and publish the resolved peak before config::set_runtime_config_overrides. In resume, perform the same parse/policy ordering before the existing lines 3757-3765 profile/runtime block, then construct the session from that result at line 3819.
-6. Use the existing launch_request_mutex and stream_lifecycle_gate acquired by the /launch and /resume routes at nvhttp.cpp:4561-4576 as the atomic owner-selection seam. While that gate observes no activity, the first request evaluates and publishes one target. If activity is present, the request must preserve the existing runtime target and mark its session result shared-active-session; it must not evaluate a client peak into global overrides. has_stream_session_activity() already includes pending RTSP/WebRTC activity and teardown.
-7. Define lifecycle cleanup: a first-request failure before successful session publication restores/clears provisional runtime overrides through the existing guards; a joining client never clears the owner; final-session teardown uses the existing runtime-override cleanup so a later idle request can select a new target.
+6. Use the existing launch_request_mutex and stream_lifecycle_gate acquired by the /launch and /resume routes at nvhttp.cpp:4561-4576 as the atomic owner-selection seam. Compute final effective HDR request before policy selection. While that gate observes no activity, the first or replacement request snapshots the prior runtime map and owner record, evaluates, and publishes one target. If activity is present, the request must preserve the existing runtime target and mark its session result shared-active-session; it must not evaluate a client peak into global overrides. has_stream_session_activity() already includes pending RTSP/WebRTC activity and teardown.
+7. Define lifecycle cleanup without assuming final stream teardown clears the map: a failed first or replacement request restores the prior runtime map and owner record; a joining client never clears the owner; when the last stream disconnects while the app remains paused, retain the owner/map for resume; the next truly idle request may replace it transactionally; application termination performs the existing eventual clear. Add the owner record separately from the runtime map so stale-map emptiness is not used as an ownership signal.
 8. Keep any selected host profile associated with the session even if its MHC2 read fails, suppress client values in that case, and use the existing global fallback.
 9. Update verbose query logging to print only that the capability field was present, absent, or invalid plus its parse reason; never log the base64 or decoded JSON.
 10. Keep /launch and /resume behavior symmetric and preserve old-client behavior when the field is missing.
@@ -169,14 +171,15 @@
 
 1. Keep the wire model/serializer platform-neutral and put Windows display/profile discovery behind the Windows implementation boundary. Non-Windows builds must compile with no-op collection and no new Windows dependency.
 2. Add a selected-display resolver that returns success only when the QScreen geometry maps to one SDL display. Preserve the existing display-0 fallback for rendering if desired, but pass an unresolved result to the capability collector so it emits no data. After SDL_SetWindowPosition(testWindow, x, y), require SDL_GetWindowDisplayIndex(testWindow) to equal the resolved index before collecting.
-3. Reuse the DISPLAYCONFIG mapping pattern already present in app/streaming/video/ffmpeg-renderers/d3d11va.cpp: query active paths, match the output GDI name, require one unique path, and retain the adapter LUID/source ID needed by the Windows ColorProfile APIs.
-4. On Windows, dynamically resolve ColorProfileGetDisplayUserScope and ColorProfileGetDisplayDefault from mscms.dll. Query the selected scope and request CPT_ICC with CPST_EXTENDED_DISPLAY_COLOR_MODE. Free the returned profile name with LocalFree. If exports, OS support, scope, subtype, file, or profile parsing are unavailable, omit calibrated and continue to the display-reported fallback.
+3. Reuse the DISPLAYCONFIG mapping pattern already present in app/streaming/video/ffmpeg-renderers/d3d11va.cpp: query active paths, match the output GDI name, require one unique path, and retain the complete identity. Use sourceInfo.adapterId/sourceInfo.id for the GDI source lookup, but pass targetInfo.adapterId as ColorProfile `targetAdapterID` and sourceInfo.id as `sourceID`.
+4. On Windows, dynamically resolve ColorProfileGetDisplayUserScope and ColorProfileGetDisplayDefault from mscms.dll. Query the selected scope and request CPT_ICC with CPST_EXTENDED_DISPLAY_COLOR_MODE. Free the returned profile name with LocalFree. Resolve a bare returned filename through GetColorDirectoryW (or an equivalent canonical Windows color-directory helper), constrain the result to that directory, reject empty/absolute/traversal-shaped names, then apply the 32 MiB and MHC2 checks. If exports, OS support, scope, subtype, file, or profile parsing are unavailable, omit calibrated and continue to the display-reported fallback.
 5. Apply the host's proven MHC2 bounds and fixed-point conversion in a client-local helper: maximum 32 MiB file, valid MHC2 tag structure, finite positive peak in 1..100000, nearest-nit rounding. Do not use WcsGetDefaultColorProfile or GetICMProfile as the HDR authority.
-6. Query the mapped DXGI output through IDXGIOutput6::GetDesc1().MaxLuminance and normalize it to an integer nit value only when the output is current, uniquely mapped, HDR-capable, and finite/positive. Keep the JSON member named edid for v1 compatibility but label its source dxgi-output; treat ambiguous, SDR, clone/default, detached, or stale output data as absent.
-7. Emit calibrated and display-reported values independently when available. A calibrated value is not replaced by the display-reported fallback, and the fallback remains useful if the ICC/MHC2 association is absent or unreadable.
-8. Serialize only the normalized values and source labels. Never send the physical ICC path, profile bytes, monitor name, adapter/source identifiers, EDID blob, or other identifying data.
-9. Store only the encoded immutable capability string on the session until the asynchronous launch request consumes it. Ensure collection occurs on the GUI/display thread and does not block the launch worker on repeated profile scans.
-10. Add the new sources/headers to app.pro and link the required DXGI/Windows libraries; resolve mscms.dll functions dynamically rather than requiring a new hard link that breaks older supported Windows versions.
+6. Query the mapped DXGI output through IDXGIOutput6::GetDesc1().MaxLuminance and normalize it to an integer nit value only when the output is current, uniquely mapped, `AttachedToDesktop`, finite/positive, and `ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`. Reject every other color space, including SDR, scRGB, studio-PQ, YCbCr, clone/default, detached, or stale output data. Keep the JSON member named edid for v1 compatibility but label its source dxgi-output.
+7. Capture the QScreen/SDL/DISPLAYCONFIG/DXGI identity before profile and output reads, then revalidate the hidden-window display index and complete identity tuple afterward. Any mutation from hotplug, clone transition, relocation, or output replacement omits the capability snapshot.
+8. Emit calibrated and display-reported values independently when available. A calibrated value is not replaced by the display-reported fallback, and the fallback remains useful if the ICC/MHC2 association is absent or unreadable.
+9. Serialize only the normalized values and source labels. Never send the physical ICC path, profile bytes, monitor name, adapter/source identifiers, EDID blob, or other identifying data.
+10. Store only the encoded immutable capability string on the session until the asynchronous launch request consumes it. Ensure collection occurs on the GUI/display thread and does not block the launch worker on repeated profile scans.
+11. Add the new sources/headers to app.pro and link the required DXGI/Windows libraries; resolve mscms.dll functions dynamically rather than requiring a new hard link that breaks older supported Windows versions.
 
 **Verification:** Run the Moonlight QtTest suite with synthetic MHC2/DXGI/API fixtures. On Windows, exercise one monitor, a multi-monitor layout with negative coordinates, null/unmatched/duplicate QScreen mapping, hidden-window placement mismatch, ICC missing, STANDARD-only profile, missing mscms exports, pre-20348 behavior, malformed MHC2, DXGI mapping failure, SDR/clone/default output, and a display with both sources. Confirm the payload follows the selected stream display rather than whichever monitor owns the process window, and is omitted for every unresolved/ambiguous case.
 
@@ -196,7 +199,7 @@
 1. Extend NvHTTP::startApp with an optional encoded capability argument whose default preserves existing callers.
 2. Append clientDisplayCapabilities=<percent-encoded-base64url> to both /launch and /resume query construction when the request is HDR, the host is not GFE, and the encoded value is non-empty and within the client-side bound.
 3. Preserve all existing hdrMode, clientHdrCapVersion, clientHdrCapSupportedFlagsInUint32, clientHdrCapMetaDataId, and clientHdrCapDisplayData parameters unchanged.
-4. Omit the custom field for GFE and when collection yields no usable value, avoiding reliance on unknown-parameter tolerance in legacy servers.
+4. Omit the custom field for GFE and when collection yields no usable value. The supported pre-feature Vibepollo parser baseline `f8c4ac2762b351457ee57aef0863655d18b936e4` ignores unknown query keys, so v1 does not defer an abstract legacy-host gate or change the request architecture.
 5. Add request serialization tests for both verbs, HDR/non-HDR, GFE/non-GFE, empty payload, and percent-encoding.
 
 **Verification:** Build the Moonlight app and opt-in tests, run the request tests, and inspect captured URLs to confirm no raw JSON/path/ICC data is present and no legacy query field changes.
@@ -250,21 +253,21 @@
    - run git diff --check.
 3. Compatibility:
    - old Moonlight to new Vibepollo: no custom field, existing behavior;
-   - new Moonlight to old host: verify the pre-feature host query parser ignores the unknown field; if a historical host rejects it, add a concrete host-version/capability gate before enabling transmission;
+   - new Moonlight to the pinned pre-feature Vibepollo host baseline `f8c4ac2762b351457ee57aef0863655d18b936e4`: verify the map-based launch/resume parser ignores the unknown field, and freeze that result as the v1 compatibility contract;
    - GFE launch/resume: no custom field;
-   - malformed, oversized, unknown-version, wrong-platform, and non-finite payloads: invalid values ignored; in-range fractional values are rounded identically by host and client;
+   - malformed, oversized, unknown-version, wrong-platform, and non-finite payloads: invalid values ignored; in-range fractional values are rounded identically by host and client; valid client values on SDR requests are ignored by host policy;
    - manual valid/missing/malformed profile: manual selection suppresses client values and preserves global fallback on failure;
    - calibrated ICC plus Windows/DXGI display-reported value: ICC wins;
    - display-reported value only: it is used only for a current, unique HDR output;
    - unresolved, mirrored, SDR, detached, or clone/default output: no client capability is sent;
-   - multiple viewers: first idle request owns the target, later viewers inherit it, failed first launches release it, and final teardown permits a later owner;
+   - multiple viewers: first idle request owns the target, later viewers inherit it, failed first/replacement launches restore the prior owner, paused-app disconnect retains the map, and a later idle request can replace it transactionally;
    - Sunshine: resolved peak reaches virtual-display HDR request;
    - SudoVDA: runtime-only behavior is reported accurately in redacted logs and static documentation;
    - native HDR and RTX HDR: verify only the existing consumers are affected.
 4. Capture launch/resume logs with verbose logging enabled and confirm capability payload contents are never logged.
 5. Compare the final diff against the committed design spec and this plan. Remove any implementation or test artifacts not required by the feature.
 
-**Verification target:** All focused and full tests pass in the available environments; any hardware/driver-only matrix row is explicitly recorded with observed result or environment limitation rather than marked as passed without evidence.
+**Verification target:** All focused and full tests pass in the available environments. Each hardware/driver-only row is recorded with one of `observed`, `unavailable`, or `not-applicable`; `unavailable` is an environment limitation, never a passing result.
 
 **Commit:** test: verify automatic client HDR calibration integration
 

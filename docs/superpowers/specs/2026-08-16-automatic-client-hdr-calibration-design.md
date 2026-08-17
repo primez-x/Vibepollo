@@ -72,6 +72,11 @@ client data, even when that host profile has no readable MHC2 peak; in that
 case the existing global fallback is retained while the selected host profile
 continues through the existing association path.
 
+Client-derived values are eligible only when the host's final effective HDR
+request for that launch or resume is enabled. This is a host-side policy
+check, not merely a sender-side omission rule; a valid capability on an SDR
+request must not replace the host's process-global HDR target.
+
 The client reports values, not a profile path or file. The calibrated source
 is the active extended-color display profile associated with the display where
 Moonlight will place the stream window. The wire object's `edid` member is
@@ -155,26 +160,41 @@ asynchronous launch request is started:
    keep the existing rendering fallback if needed, but send no capability
    payload. The real SDL stream window does not exist until after the host
    launch request, so it must not be queried from the launch worker.
-2. Map that display's GDI/DXGI identity to a `DISPLAYCONFIG` source adapter LUID
-   and source ID, reusing the existing mapping approach in
-   `d3d11va.cpp`. Dynamically resolve the Windows ColorProfile APIs from
-   `mscms.dll` so older supported Windows versions remain loadable when those
-   exports are unavailable.
+2. Map that display's GDI/DXGI identity to one active `DISPLAYCONFIG` path,
+   reusing the existing mapping approach in `d3d11va.cpp`. Retain the complete
+   identity tuple. The GDI source lookup uses `path.sourceInfo.adapterId` and
+   `path.sourceInfo.id`, while the ColorProfile APIs receive
+   `path.targetInfo.adapterId` as `targetAdapterID` plus
+   `path.sourceInfo.id` as `sourceID`. Dynamically resolve the Windows
+   ColorProfile APIs from `mscms.dll` so older supported Windows versions
+   remain loadable when those exports are unavailable.
 3. Query `ColorProfileGetDisplayUserScope()` and
    `ColorProfileGetDisplayDefault()` with `CPT_ICC` and
-   `CPST_EXTENDED_DISPLAY_COLOR_MODE`. Read the returned profile only locally,
-   bound the file to the same 32 MiB/structural checks as the host, and parse
-   its MHC2 peak. Missing exports, unsupported OS builds, missing profiles,
-   `STANDARD`-only profiles, and parse failures produce no calibrated value.
+   `CPST_EXTENDED_DISPLAY_COLOR_MODE`. The returned profile name is resolved
+   through the Windows color directory (`GetColorDirectoryW` or an equivalent
+   canonical helper), constrained to that directory, and then read only
+   locally. Reject empty, absolute, traversal-shaped, missing, or unreadable
+   names before applying the same 32 MiB/structural checks as the host and
+   parsing MHC2. Free the API-owned name with `LocalFree`. Missing exports,
+   unsupported OS builds, missing profiles, `STANDARD`-only profiles, and
+   parse failures produce no calibrated value.
 4. Query the selected DXGI output through
    `IDXGIOutput6::GetDesc1()`. Populate the wire object's `edid` member with
    `source: "dxgi-output"` only when the descriptor is current, uniquely
-   mapped, HDR-capable, and has a finite positive `MaxLuminance`; otherwise
-   omit it. This is a Windows/DXGI display-reported fallback, not a claim of
-   raw EDID provenance.
+   mapped, attached to the desktop, reports the v1 HDR color space
+   `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`, and has a finite positive
+   `MaxLuminance`; reject SDR, scRGB/other color spaces, clone/default,
+   detached, ambiguous, or stale output data. This conservative allowlist is
+   a Windows/DXGI display-reported fallback, not a claim of raw EDID
+   provenance.
 5. Serialize only the normalized peak values; never send the client file path,
    profile filename, monitor serial, adapter identifiers, or raw ICC/EDID
    bytes.
+
+Capture the selected-display identity before profile/DXGI reads and revalidate
+the QScreen-to-SDL index plus the complete DISPLAYCONFIG/DXGI identity tuple
+afterward. A hotplug, clone transition, window relocation, or output change
+between those phases invalidates the snapshot and sends no capability.
 
 The collector must tolerate missing profiles, displays without HDR support,
 profile parse failures, and Windows API races. It should log the local source
@@ -234,11 +254,14 @@ The host runtime override is process-wide. The existing HTTP route locks
 ownership decisions. While holding that lifecycle gate, an idle first session
 resolves and publishes the effective target. A joining RTSP/WebRTC request
 observes activity and must not mutate the active runtime target; it inherits
-the already-published runtime value. A failed first launch must release or
-restore the provisional override, and final-session teardown must clear it
-through the existing runtime-override lifecycle. Per-session capability fields
-may still be retained for logs, but they do not retarget global
-capture/encoder state.
+the already-published runtime value. A failed first or replacement launch
+must restore the previous runtime-override snapshot and owner record.
+Final stream teardown must not blanket-clear overrides while an application is
+paused; the owner record and retained map remain available for resume. The
+next request that observes true lifecycle idleness may transactionally replace
+that target, while application termination performs the existing eventual
+clear. Per-session capability fields may still be retained for logs, but they
+do not retarget global capture/encoder state while another owner is active.
 
 ## User interface and documentation
 
@@ -268,9 +291,11 @@ translation/fallback conventions rather than replacing unrelated translations.
   client-side protocol change.
 - GFE launch/resume requests do not receive the custom parameter; the current
   GFE request shape remains unchanged.
-- Old Vibepollo hosts must ignore the unknown launch parameter from a newer
-  client; the implementation plan must source-check the pre-feature query
-  parser and add a concrete gate if any supported historical host rejects it.
+- The pinned pre-feature Vibepollo baseline
+  `f8c4ac2762b351457ee57aef0863655d18b936e4` parses launch/resume query
+  parameters as a map and reads known keys without rejecting unknown keys.
+  New clients may therefore send this optional field to that host family; no
+  deferred version-gate branch is part of v1. GFE remains explicitly excluded.
 - No client-supplied value is persisted or treated as trusted configuration.
 - No client-supplied path is opened by the host.
 - Payload size, numeric ranges, and JSON structure are bounded before use.
@@ -285,8 +310,13 @@ translation/fallback conventions rather than replacing unrelated translations.
 - Unit-test profile/MHC2 extraction for valid, absent, truncated, malformed,
   and out-of-range profiles.
 - Unit-test Windows/DXGI peak normalization and omission behavior when the
-  output is SDR, cloned, detached, ambiguous, stale, or unavailable. The
-  source label is `client-dxgi-output`; `edid` is only the v1 wire member name.
+  output is non-PQ/SDR, cloned, detached, ambiguous, stale, or unavailable.
+  The v1 allowlist is exactly
+  `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`. The source label is
+  `client-dxgi-output`; `edid` is only the v1 wire member name.
+- Unit-test profile-name resolution from a bare API-returned filename through
+  the Windows color directory, including missing, traversal-shaped, oversized,
+  and unreadable files.
 - Unit-test serialization for calibrated-plus-EDID, calibrated-only,
   EDID-only, and no-data cases.
 - Verify the launch request includes the new parameter before both launch and
@@ -298,6 +328,9 @@ translation/fallback conventions rather than replacing unrelated translations.
 - Verify missing modern Windows color APIs and pre-20348 behavior leave
   Moonlight loadable and omit calibrated data while preserving the DXGI/global
   fallback.
+- Verify a post-read display-identity mutation, hidden-window relocation, or
+  clone/hotplug transition invalidates the snapshot rather than reporting the
+  wrong output.
 
 ### Vibepollo
 
@@ -307,12 +340,18 @@ translation/fallback conventions rather than replacing unrelated translations.
   non-empty host ICC profile with valid and invalid MHC2 data, client calibrated
   profile, client EDID, and global default. A selected host profile must never
   fall through to client data.
+- Unit-test that client-derived values are ignored for SDR launch and resume
+  requests on both idle-owner and active-join paths, while explicit host
+  overrides retain their existing semantics.
 - Unit-test runtime override creation to ensure the selected peak reaches the
   existing `rtx_hdr_peak_brightness` field.
 - Unit-test that automatic client data does not trigger host physical ICC
   association or persistence.
 - Unit-test startup cloning and shared-session ownership so a second client
   cannot retarget process-global runtime state.
+- Unit-test paused-application ownership: a disconnected owner's retained map
+  is restored after a failed replacement, a successful idle resume replaces it,
+  and application termination performs the eventual clear.
 - Unit-test request logging redaction for the custom capability parameter.
 - Test Sunshine virtual-display creation with a client calibrated peak and
   verify the requested HDR display-reported peak. Test SudoVDA separately and
