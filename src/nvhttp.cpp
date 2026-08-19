@@ -3262,6 +3262,14 @@ namespace nvhttp {
 
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
 
+      const bool launch_hdr_requested = util::from_view(get_arg(args, "hdrMode", "0"));
+      const bool launch_prefer_sdr_10bit = verified_client && verified_client->prefer_10bit_sdr;
+      bool launch_force_sdr = false;
+#ifdef _WIN32
+      launch_force_sdr = config::video.dd.hdr_request_override ==
+        config::video_t::dd_t::hdr_request_override_e::force_off;
+#endif
+
       bool no_active_sessions = !has_stream_session_activity();
       // Runtime overrides are global process state. Do not reapply them while
       // another RTSP/WebRTC session is active, otherwise a second client can mutate
@@ -3351,7 +3359,11 @@ namespace nvhttp {
           if (!overrides.contains("rtx_hdr_peak_brightness")) {
             if (const auto client_peak = client_hdr_peak_from_args(
                   args,
-                  rtsp_stream::effective_hdr_requested(*launch_session)
+                  rtsp_stream::effective_hdr_requested(
+                    launch_hdr_requested,
+                    launch_prefer_sdr_10bit,
+                    launch_force_sdr
+                  )
                 )) {
               overrides.insert_or_assign("rtx_hdr_peak_brightness", std::to_string(client_peak->peak_nits));
               BOOST_LOG(info) << "HDR peak: using " << client_peak->peak_nits
