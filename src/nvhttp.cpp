@@ -44,6 +44,7 @@
 // local includes
 #include "app_display_policy.h"
 #include "config.h"
+#include "client_hdr_peak.h"
 #include "display_device.h"
 #include "display_helper_integration.h"
 #include "file_handler.h"
@@ -1549,6 +1550,20 @@ namespace nvhttp {
         throw std::out_of_range(name);
       }
       return it->second;
+    }
+
+    std::optional<client_hdr_peak::result_t> client_hdr_peak_from_args(
+      const args_t &args,
+      const bool effective_hdr_requested
+    ) {
+      if (!effective_hdr_requested || get_arg(args, "hdrMode", "0") != "1") {
+        return std::nullopt;
+      }
+
+      return client_hdr_peak::resolve(
+        get_arg(args, "clientHdrPeakCalibrated", ""),
+        get_arg(args, "clientHdrPeakEdid", "")
+      );
     }
 
 
@@ -3092,6 +3107,9 @@ namespace nvhttp {
 
       tree.put("root.appversion", VERSION);
       tree.put("root.GfeVersion", GFE_VERSION);
+      // Versioned capability for the narrow client HDR peak report. Clients
+      // must not send the extension unless this exact version is advertised.
+      tree.put("root.ClientHdrPeakVersion", 1);
       tree.put("root.uniqueid", http::unique_id);
       tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
       tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
@@ -3926,10 +3944,49 @@ namespace nvhttp {
                               << (*profile_peak == effective_peak ? "." : " (clamped to supported range).");
             } else {
               BOOST_LOG(warning) << "HDR peak: profile '" << client_settings->hdr_profile
-                                 << "' has no readable MHC2 peak; using the configured default.";
+                                 << "' has no readable MHC2 peak; falling through to client report or configured default.";
             }
           }
 #endif
+
+          bool launch_hdr_requested = util::from_view(get_arg(args, "hdrMode", "0"));
+          bool launch_prefer_sdr_10bit = verified_client && verified_client->prefer_10bit_sdr;
+          bool launch_force_sdr = false;
+#ifdef _WIN32
+          {
+            using override_e = config::video_t::dd_t::hdr_request_override_e;
+            switch (config::video.dd.hdr_request_override) {
+              case override_e::force_on:
+                launch_hdr_requested = true;
+                launch_prefer_sdr_10bit = false;
+                break;
+              case override_e::force_off:
+                launch_hdr_requested = false;
+                launch_force_sdr = true;
+                break;
+              case override_e::automatic:
+                break;
+            }
+          }
+#endif
+
+          if (!overrides.contains("rtx_hdr_peak_brightness")) {
+            if (const auto client_peak = client_hdr_peak_from_args(
+                  args,
+                  rtsp_stream::effective_hdr_requested(
+                    launch_hdr_requested,
+                    launch_prefer_sdr_10bit,
+                    launch_force_sdr
+                  )
+                )) {
+              overrides.insert_or_assign("rtx_hdr_peak_brightness", std::to_string(client_peak->peak_nits));
+              BOOST_LOG(info) << "HDR peak: using " << client_peak->peak_nits
+                              << " nits from "
+                              << (client_peak->source == client_hdr_peak::source_e::calibrated
+                                    ? "client ICC/MHC2 calibration."
+                                    : "client DXGI/EDID display report.");
+            }
+          }
 
           config::set_runtime_config_overrides(std::move(overrides));
           runtime_overrides_applied = true;
@@ -4345,6 +4402,35 @@ namespace nvhttp {
       }
     }
 #endif
+
+    const bool resume_hdr_requested = util::from_view(get_arg(args, "hdrMode", "0"));
+    const bool resume_prefer_sdr_10bit = verified_client && verified_client->prefer_10bit_sdr;
+    bool resume_force_sdr = false;
+#ifdef _WIN32
+    resume_force_sdr = config::video.dd.hdr_request_override ==
+      config::video_t::dd_t::hdr_request_override_e::force_off;
+#endif
+
+    if (!requested_runtime_overrides.contains("rtx_hdr_peak_brightness")) {
+      if (const auto client_peak = client_hdr_peak_from_args(
+            args,
+            rtsp_stream::effective_hdr_requested(
+              resume_hdr_requested,
+              resume_prefer_sdr_10bit,
+              resume_force_sdr
+            )
+          )) {
+        requested_runtime_overrides.insert_or_assign(
+          "rtx_hdr_peak_brightness",
+          std::to_string(client_peak->peak_nits)
+        );
+        BOOST_LOG(info) << "HDR peak: using " << client_peak->peak_nits
+                        << " nits from "
+                        << (client_peak->source == client_hdr_peak::source_e::calibrated
+                              ? "client ICC/MHC2 calibration."
+                              : "client DXGI/EDID display report.");
+      }
+    }
 
     if (!no_active_sessions &&
         !config::adapter_config_overrides_compatible_with_active(requested_runtime_overrides)) {

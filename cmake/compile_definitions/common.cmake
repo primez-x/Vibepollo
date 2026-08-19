@@ -104,6 +104,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/remote_display_topology.h"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.cpp"
         "${CMAKE_SOURCE_DIR}/src/nvhttp.h"
+        "${CMAKE_SOURCE_DIR}/src/client_hdr_peak.cpp"
+        "${CMAKE_SOURCE_DIR}/src/client_hdr_peak.h"
         "${CMAKE_SOURCE_DIR}/src/httpcommon.cpp"
         "${CMAKE_SOURCE_DIR}/src/http_policy.cpp"
         "${CMAKE_SOURCE_DIR}/src/httpcommon.h"
