@@ -48,3 +48,31 @@ TEST(AudioVisibilityRecovery, ClassifyHealDecisions) {
   // A present but inactive endpoint is the interrupted hide to undo.
   EXPECT_EQ(classify_heal(true, true, false), heal_action_e::reshow_endpoint);
 }
+
+TEST(AudioVisibilityRecovery, NoMoreItemsRequiresConfirmedExistingEndpoint) {
+  using platf::audio::visibility_recovery::should_recover_existing_steam_endpoint;
+
+  EXPECT_TRUE(should_recover_existing_steam_endpoint(true, true, true, true));
+  EXPECT_FALSE(should_recover_existing_steam_endpoint(true, false, true, true));
+  EXPECT_FALSE(should_recover_existing_steam_endpoint(true, true, false, true));
+  EXPECT_FALSE(should_recover_existing_steam_endpoint(true, true, true, false));
+  EXPECT_FALSE(should_recover_existing_steam_endpoint(false, true, true, true));
+}
+
+TEST(AudioVisibilityRecovery, RefreshesStalePolicyClientAfterFalseSuccess) {
+  using platf::audio::visibility_recovery::should_refresh_policy_client;
+
+  EXPECT_TRUE(should_refresh_policy_client(true, true, false));
+  EXPECT_FALSE(should_refresh_policy_client(true, false, false));
+  EXPECT_FALSE(should_refresh_policy_client(true, true, true));
+  EXPECT_FALSE(should_refresh_policy_client(false, true, false));
+}
+
+TEST(AudioVisibilityRecovery, RegistryCandidateRejectsSteamAuxJack) {
+  using platf::audio::visibility_recovery::is_registered_steam_speaker_candidate;
+
+  EXPECT_TRUE(is_registered_steam_speaker_candidate(true, true, true));
+  EXPECT_FALSE(is_registered_steam_speaker_candidate(false, false, true));
+  EXPECT_FALSE(is_registered_steam_speaker_candidate(true, false, true));
+  EXPECT_FALSE(is_registered_steam_speaker_candidate(true, true, false));
+}

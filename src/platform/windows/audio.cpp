@@ -35,6 +35,7 @@
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/platform/windows/misc.h"
 #include "utf_utils.h"
 
 // Must be the last included file
@@ -1399,15 +1400,19 @@ namespace platf::audio {
     /**
      * @brief Search for currently present audio device_id using multiple match fields.
      * @param match_list Pairs of match fields and values
+     * @param state_mask Endpoint states to include in the search
      * @return Optional pair of matched field and device_id
      */
-    std::optional<matched_field_t> find_device_id(const match_fields_list_t &match_list) {
+    std::optional<matched_field_t> find_device_id(
+      const match_fields_list_t &match_list,
+      const DWORD state_mask = DEVICE_STATE_ACTIVE
+    ) {
       if (match_list.empty()) {
         return std::nullopt;
       }
 
       collection_t collection;
-      auto status = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+      auto status = device_enum->EnumAudioEndpoints(eRender, state_mask, &collection);
       if (FAILED(status)) {
         BOOST_LOG(error) << "Couldn't enumerate: [0x"sv << util::hex(status).to_string_view() << ']';
         return std::nullopt;
@@ -1467,6 +1472,100 @@ namespace platf::audio {
         if (!matched[i].empty()) {
           return matched_field_t(match_list[i].first, matched[i]);
         }
+      }
+
+      return std::nullopt;
+    }
+
+    /**
+     * @brief Locate a policy-hidden Steam endpoint that IMMDevice enumeration omits.
+     */
+    static std::optional<std::wstring> find_registered_steam_endpoint_id() {
+      constexpr wchar_t render_key[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\MMDevices\\Audio\\Render";
+      constexpr wchar_t interface_name_value[] = L"{b3f8fa53-0004-438e-9003-51a46e139bfc},6";
+      constexpr wchar_t endpoint_name_value[] = L"{a45c254e-df1c-4efd-8020-67d146a850e0},2";
+      constexpr wchar_t steam_interface_name[] = L"Steam Streaming Speakers";
+      constexpr wchar_t speaker_endpoint_name[] = L"Speakers";
+
+      HKEY render_root {};
+      if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, render_key, 0, KEY_READ | KEY_WOW64_64KEY, &render_root) != ERROR_SUCCESS) {
+        return std::nullopt;
+      }
+      auto close_root = util::fail_guard([render_root]() {
+        RegCloseKey(render_root);
+      });
+
+      for (DWORD index = 0;; ++index) {
+        std::array<wchar_t, 256> endpoint_key {};
+        DWORD endpoint_key_size = static_cast<DWORD>(endpoint_key.size());
+        const auto enum_status = RegEnumKeyExW(render_root, index, endpoint_key.data(), &endpoint_key_size, nullptr, nullptr, nullptr, nullptr);
+        if (enum_status == ERROR_NO_MORE_ITEMS) {
+          break;
+        }
+        if (enum_status != ERROR_SUCCESS) {
+          continue;
+        }
+
+        HKEY endpoint_state_key {};
+        if (RegOpenKeyExW(render_root, endpoint_key.data(), 0, KEY_READ, &endpoint_state_key) != ERROR_SUCCESS) {
+          continue;
+        }
+        DWORD endpoint_state {};
+        DWORD endpoint_state_size = sizeof(endpoint_state);
+        const auto state_status = RegGetValueW(
+          endpoint_state_key,
+          nullptr,
+          L"DeviceState",
+          RRF_RT_REG_DWORD,
+          nullptr,
+          &endpoint_state,
+          &endpoint_state_size
+        );
+        RegCloseKey(endpoint_state_key);
+        if (state_status != ERROR_SUCCESS) {
+          continue;
+        }
+
+        std::wstring properties_path {endpoint_key.data(), endpoint_key_size};
+        properties_path += L"\\Properties";
+        HKEY properties_key {};
+        if (RegOpenKeyExW(render_root, properties_path.c_str(), 0, KEY_READ, &properties_key) != ERROR_SUCCESS) {
+          continue;
+        }
+
+        std::array<wchar_t, 256> interface_name {};
+        std::array<wchar_t, 256> endpoint_name {};
+        DWORD interface_name_size = static_cast<DWORD>(interface_name.size() * sizeof(wchar_t));
+        DWORD endpoint_name_size = static_cast<DWORD>(endpoint_name.size() * sizeof(wchar_t));
+        const auto value_status = RegGetValueW(
+          properties_key,
+          nullptr,
+          interface_name_value,
+          RRF_RT_REG_SZ,
+          nullptr,
+          interface_name.data(),
+          &interface_name_size
+        );
+        const auto endpoint_name_status = RegGetValueW(
+          properties_key,
+          nullptr,
+          endpoint_name_value,
+          RRF_RT_REG_SZ,
+          nullptr,
+          endpoint_name.data(),
+          &endpoint_name_size
+        );
+        RegCloseKey(properties_key);
+        if (value_status != ERROR_SUCCESS || endpoint_name_status != ERROR_SUCCESS ||
+            !visibility_recovery::is_registered_steam_speaker_candidate(
+              (endpoint_state & DEVICE_STATEMASK_ALL) == DEVICE_STATE_ACTIVE,
+              std::wcscmp(endpoint_name.data(), speaker_endpoint_name) == 0,
+              std::wcscmp(interface_name.data(), steam_interface_name) == 0
+            )) {
+          continue;
+        }
+
+        return L"{0.0.0.00000000}."s + std::wstring {endpoint_key.data(), endpoint_key_size};
       }
 
       return std::nullopt;
@@ -3224,6 +3323,91 @@ namespace platf::audio {
         return true;
       } else {
         auto err = GetLastError();
+
+        if (err == ERROR_NO_MORE_ITEMS) {
+          const auto all_state_match = find_device_id(match_steam_speakers(), DEVICE_STATEMASK_ALL);
+          auto registered_endpoint_id = find_registered_steam_endpoint_id();
+          if (!registered_endpoint_id && all_state_match) {
+            registered_endpoint_id = all_state_match->second;
+          }
+          bool visibility_restored = false;
+          bool endpoint_active = false;
+          if (registered_endpoint_id) {
+            BOOST_LOG(info) << "Found registered Steam audio endpoint ["sv << utf_utils::to_utf8(*registered_endpoint_id) << ']';
+            const auto visibility_status = policy->SetEndpointVisibility(registered_endpoint_id->c_str(), TRUE);
+            visibility_restored = SUCCEEDED(visibility_status);
+            if (!visibility_restored) {
+              BOOST_LOG(warning) << "Couldn't restore existing Steam audio endpoint visibility: [0x"sv
+                                 << util::hex(visibility_status).to_string_view() << ']';
+            } else if (auto active_match = find_device_id(match_steam_speakers())) {
+              endpoint_active = active_match->second == *registered_endpoint_id;
+            }
+
+            // DiInstallDriverW() can leave the existing policy client with a
+            // stale endpoint view even when SetEndpointVisibility() reports
+            // success. Apply the repair under the interactive user's token;
+            // endpoint visibility is user policy even when Sunshine runs from
+            // its service wrapper.
+            if (visibility_recovery::should_refresh_policy_client(err == ERROR_NO_MORE_ITEMS, visibility_restored, endpoint_active)) {
+              HANDLE user_token = platf::retrieve_users_token(false);
+              if (user_token) {
+                HRESULT retry_status = E_FAIL;
+                std::error_code impersonation_error;
+                std::thread recovery_thread([&]() {
+                  impersonation_error = platf::impersonate_current_user(user_token, [&]() {
+                    const auto co_status = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                    const bool owns_com = SUCCEEDED(co_status);
+                    policy_t recovery_policy;
+                    const auto policy_status = CoCreateInstance(
+                      CLSID_CPolicyConfigClient,
+                      nullptr,
+                      CLSCTX_ALL,
+                      IID_IPolicyConfig,
+                      (void **) &recovery_policy
+                    );
+                    if (SUCCEEDED(policy_status)) {
+                      retry_status = recovery_policy->SetEndpointVisibility(registered_endpoint_id->c_str(), TRUE);
+                    }
+                    if (owns_com) {
+                      CoUninitialize();
+                    }
+                  });
+                });
+                recovery_thread.join();
+                CloseHandle(user_token);
+                visibility_restored = !impersonation_error && SUCCEEDED(retry_status);
+                if (!visibility_restored) {
+                  BOOST_LOG(warning) << "Couldn't restore the existing Steam endpoint under the interactive user: impersonation="sv
+                                     << impersonation_error.message() << ", policy=0x"sv << util::hex(retry_status).to_string_view();
+                }
+              } else {
+                BOOST_LOG(warning) << "Couldn't obtain the interactive user token for Steam endpoint recovery"sv;
+                visibility_restored = false;
+              }
+
+              if (visibility_restored) {
+                if (auto active_match = find_device_id(match_steam_speakers())) {
+                  endpoint_active = active_match->second == *registered_endpoint_id;
+                }
+              }
+            }
+          } else {
+            BOOST_LOG(warning) << "Couldn't locate the registered Steam audio endpoint"sv;
+          }
+
+          if (visibility_recovery::should_recover_existing_steam_endpoint(
+                err == ERROR_NO_MORE_ITEMS,
+                registered_endpoint_id.has_value(),
+                visibility_restored,
+                endpoint_active
+              )) {
+            BOOST_LOG(info) << "Steam Streaming Speakers was already installed; restored endpoint visibility"sv;
+            return true;
+          }
+
+          BOOST_LOG(warning) << "Steam Streaming Speakers was already installed, but the configured endpoint could not be confirmed active"sv;
+        }
+
         switch (err) {
           case ERROR_ACCESS_DENIED:
             BOOST_LOG(warning) << "Administrator privileges are required to install Steam Streaming Speakers"sv;
@@ -3231,6 +3415,8 @@ namespace platf::audio {
           case ERROR_FILE_NOT_FOUND:
           case ERROR_PATH_NOT_FOUND:
             BOOST_LOG(info) << "Steam audio drivers not found. This is expected if you don't have Steam installed."sv;
+            break;
+          case ERROR_NO_MORE_ITEMS:
             break;
           default:
             BOOST_LOG(warning) << "Failed to install Steam audio drivers: "sv << err;
