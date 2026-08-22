@@ -74,6 +74,7 @@ namespace platf::dxgi {
    * @param initial_frame_buffer_size Initial WGC frame pool buffer count.
    * @param max_frame_buffer_size Maximum WGC frame pool buffer count for adaptive growth.
    * @param flags Bitmask of wgc_ipc_config_flags_e values.
+   * @param cursor_capture_enabled Whether WGC should include the host cursor.
    */
   enum wgc_ipc_config_flags_e : uint32_t {
     WGC_IPC_FLAG_DRAIN_TO_LATEST = 1u << 0,
@@ -93,6 +94,7 @@ namespace platf::dxgi {
     uint32_t max_frame_buffer_size;
     uint32_t flags;
     int32_t activity_admission_fps;
+    uint32_t cursor_capture_enabled;
   };
 
   constexpr uint32_t WGC_ACTIVITY_ADMISSION_MESSAGE_MAGIC = 0x57474341;  // "WGCA"

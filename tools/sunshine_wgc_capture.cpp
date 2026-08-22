@@ -133,7 +133,7 @@ const int INITIAL_LOG_LEVEL = 2;
 constexpr uint32_t DEFAULT_WGC_IPC_FLAGS =
   platf::dxgi::WGC_IPC_FLAG_DRAIN_TO_LATEST |
   platf::dxgi::WGC_IPC_FLAG_ALLOW_BUFFER_DECREASE;
-static platf::dxgi::config_data_t g_config = {0, 0, 0, L"", {0, 0}, 10000, 60, 1, 2, DEFAULT_WGC_IPC_FLAGS, 120};
+static platf::dxgi::config_data_t g_config = {0, 0, 0, L"", {0, 0}, 10000, 60, 1, 2, DEFAULT_WGC_IPC_FLAGS, 120, 1};
 static std::mutex g_config_mutex;
 static std::condition_variable g_config_cv;
 static std::atomic<int32_t> g_activity_admission_fps {120};
@@ -1986,6 +1986,18 @@ public:
       } catch (...) {
         BOOST_LOG(warning) << "IsBorderRequired(false) threw an unknown exception (continuing without it)";
       }
+    }
+
+    if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
+          L"Windows.Graphics.Capture.GraphicsCaptureSession", L"IsCursorCaptureEnabled")) {
+      try {
+        _capture_session.IsCursorCaptureEnabled(g_config.cursor_capture_enabled != 0);
+        BOOST_LOG(info) << "WGC cursor capture " << (g_config.cursor_capture_enabled ? "enabled" : "disabled");
+      } catch (const winrt::hresult_error &ex) {
+        BOOST_LOG(warning) << "IsCursorCaptureEnabled failed (continuing with platform default): " << ex.code() << " - " << winrt::to_string(ex.message());
+      }
+    } else {
+      BOOST_LOG(warning) << "WGC cursor capture property unavailable; continuing with platform default";
     }
 
     if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {

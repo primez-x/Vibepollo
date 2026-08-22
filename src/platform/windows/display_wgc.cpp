@@ -16,6 +16,7 @@
 // local includes
 #include "src/config.h"
 #include "ipc/ipc_session.h"
+#include "src/globals.h"
 #include "ipc/misc_utils.h"
 #include "src/logging.h"
 #include "src/platform/windows/display.h"
@@ -233,7 +234,7 @@ namespace platf::dxgi {
 
     // Create session
     _ipc_session = std::make_unique<ipc_session_t>();
-    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture)) {
+    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture, display_cursor)) {
       return -1;
     }
     game_refresh_target = make_wgc_activity_admission_target(
@@ -249,6 +250,12 @@ namespace platf::dxgi {
   capture_e display_wgc_ipc_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
     if (!_ipc_session) {
       return capture_e::error;
+    }
+
+    // WGC configures cursor capture when its helper session is created. Recreate
+    // the helper if the runtime N shortcut changes the policy while streaming.
+    if (static_cast<bool>(cursor_visible) != _ipc_session->cursor_capture_enabled()) {
+      return capture_e::reinit;
     }
 
     // We return capture::reinit for most scenarios because the logic in picking which mode to capture is all handled in the factory function.
@@ -496,7 +503,7 @@ namespace platf::dxgi {
 
     // Create session
     _ipc_session = std::make_unique<ipc_session_t>();
-    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture)) {
+    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture, display_cursor)) {
       return -1;
     }
     game_refresh_target = make_wgc_activity_admission_target(
@@ -512,6 +519,10 @@ namespace platf::dxgi {
   capture_e display_wgc_ipc_ram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
     if (!_ipc_session) {
       return capture_e::error;
+    }
+
+    if (static_cast<bool>(cursor_visible) != _ipc_session->cursor_capture_enabled()) {
+      return capture_e::reinit;
     }
 
     if (_ipc_session->should_swap_to_dxgi()) {

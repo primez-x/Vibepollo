@@ -58,7 +58,7 @@ namespace platf::dxgi {
      * @param advanced_color_capture True when the target display is already HDR/Advanced Color.
      * @return `0` on success; non-zero otherwise.
      */
-    int init(const ::video::config_t &config, std::string_view display_name, ID3D11Device *device, bool advanced_color_capture);
+    int init(const ::video::config_t &config, std::string_view display_name, ID3D11Device *device, bool advanced_color_capture, bool cursor_capture_enabled);
 
     /**
      * @brief Start the helper process and set up IPC connection if not already initialized.
@@ -136,6 +136,13 @@ namespace platf::dxgi {
     }
 
     /**
+     * @brief Return the cursor policy used when the helper was initialized.
+     */
+    bool cursor_capture_enabled() const {
+      return _cursor_capture_enabled;
+    }
+
+    /**
      * Update the helper's latest-frame admission budget without reinitializing
      * WGC or changing the display mode. This is safe from the activity worker.
      */
@@ -205,6 +212,7 @@ namespace platf::dxgi {
     ::video::config_t _config;  ///< Cached video config.
     std::string _display_name;  ///< Display name copy.
     bool _advanced_color_capture = false;  ///< True when target display is already Advanced Color/HDR.
+    bool _cursor_capture_enabled = true;  ///< Whether WGC should include the host cursor.
     std::atomic<int> _activity_admission_fps {0};  ///< Latest desired helper admission rate, retained across helper restarts.
     std::chrono::steady_clock::time_point _last_helper_stop {};  ///< Last time we tore down the helper.
   };
