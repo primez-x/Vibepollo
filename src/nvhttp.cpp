@@ -1301,6 +1301,21 @@ namespace nvhttp {
       );
     }
 
+#ifdef _WIN32
+    client_hdr_peak::request_override_e current_hdr_request_override() {
+      using config_override_e = config::video_t::dd_t::hdr_request_override_e;
+      switch (config::video.dd.hdr_request_override) {
+        case config_override_e::force_on:
+          return client_hdr_peak::request_override_e::force_on;
+        case config_override_e::force_off:
+          return client_hdr_peak::request_override_e::force_off;
+        case config_override_e::automatic:
+          return client_hdr_peak::request_override_e::automatic;
+      }
+      return client_hdr_peak::request_override_e::automatic;
+    }
+#endif
+
 
     // Helper function to extract command entries from a JSON object.
     cmd_list_t extract_command_entries(const nlohmann::json &j, const std::string &key) {
@@ -2129,20 +2144,14 @@ namespace nvhttp {
       launch_session->prefer_sdr_10bit = verified_client->prefer_10bit_sdr;
 #ifdef _WIN32
       {
-        using override_e = config::video_t::dd_t::hdr_request_override_e;
-        switch (config::video.dd.hdr_request_override) {
-          case override_e::force_on:
-            launch_session->enable_hdr = true;
-            launch_session->prefer_sdr_10bit = false;
-            launch_session->force_sdr = false;
-            break;
-          case override_e::force_off:
-            launch_session->enable_hdr = false;
-            launch_session->force_sdr = true;
-            break;
-          case override_e::automatic:
-            break;
-        }
+        const auto effective_request = client_hdr_peak::resolve_effective_request(
+          launch_session->enable_hdr,
+          launch_session->prefer_sdr_10bit,
+          current_hdr_request_override()
+        );
+        launch_session->enable_hdr = effective_request.hdr_requested;
+        launch_session->prefer_sdr_10bit = effective_request.prefer_sdr_10bit;
+        launch_session->force_sdr = effective_request.force_sdr;
       }
 #endif
       if (const auto virtual_display_arg = args.find("virtualDisplay"); virtual_display_arg != std::end(args)) {
@@ -3262,12 +3271,20 @@ namespace nvhttp {
 
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
 
-      const bool launch_hdr_requested = util::from_view(get_arg(args, "hdrMode", "0"));
-      const bool launch_prefer_sdr_10bit = verified_client && verified_client->prefer_10bit_sdr;
+      bool launch_hdr_requested = util::from_view(get_arg(args, "hdrMode", "0"));
+      bool launch_prefer_sdr_10bit = verified_client && verified_client->prefer_10bit_sdr;
       bool launch_force_sdr = false;
 #ifdef _WIN32
-      launch_force_sdr = config::video.dd.hdr_request_override ==
-        config::video_t::dd_t::hdr_request_override_e::force_off;
+      {
+        const auto effective_request = client_hdr_peak::resolve_effective_request(
+          launch_hdr_requested,
+          launch_prefer_sdr_10bit,
+          current_hdr_request_override()
+        );
+        launch_hdr_requested = effective_request.hdr_requested;
+        launch_prefer_sdr_10bit = effective_request.prefer_sdr_10bit;
+        launch_force_sdr = effective_request.force_sdr;
+      }
 #endif
 
       bool no_active_sessions = !has_stream_session_activity();
@@ -3809,12 +3826,20 @@ namespace nvhttp {
     }
 #endif
 
-    const bool resume_hdr_requested = util::from_view(get_arg(args, "hdrMode", "0"));
-    const bool resume_prefer_sdr_10bit = verified_client && verified_client->prefer_10bit_sdr;
+    bool resume_hdr_requested = util::from_view(get_arg(args, "hdrMode", "0"));
+    bool resume_prefer_sdr_10bit = verified_client && verified_client->prefer_10bit_sdr;
     bool resume_force_sdr = false;
 #ifdef _WIN32
-    resume_force_sdr = config::video.dd.hdr_request_override ==
-      config::video_t::dd_t::hdr_request_override_e::force_off;
+    {
+      const auto effective_request = client_hdr_peak::resolve_effective_request(
+        resume_hdr_requested,
+        resume_prefer_sdr_10bit,
+        current_hdr_request_override()
+      );
+      resume_hdr_requested = effective_request.hdr_requested;
+      resume_prefer_sdr_10bit = effective_request.prefer_sdr_10bit;
+      resume_force_sdr = effective_request.force_sdr;
+    }
 #endif
 
     if (!requested_runtime_overrides.contains("rtx_hdr_peak_brightness")) {

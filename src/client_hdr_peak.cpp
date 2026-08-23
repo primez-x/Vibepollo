@@ -42,4 +42,20 @@ namespace client_hdr_peak {
     }
     return std::nullopt;
   }
+
+  effective_request_t resolve_effective_request(
+    const bool client_hdr_requested,
+    const bool client_prefer_sdr_10bit,
+    const request_override_e request_override
+  ) {
+    switch (request_override) {
+      case request_override_e::force_on:
+        return {true, false, false};
+      case request_override_e::force_off:
+        return {false, client_prefer_sdr_10bit, true};
+      case request_override_e::automatic:
+        return {client_hdr_requested, client_prefer_sdr_10bit, false};
+    }
+    return {client_hdr_requested, client_prefer_sdr_10bit, false};
+  }
 }  // namespace client_hdr_peak
