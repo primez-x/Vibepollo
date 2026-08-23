@@ -234,7 +234,7 @@ namespace platf::dxgi {
 
     // Create session
     _ipc_session = std::make_unique<ipc_session_t>();
-    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture, display_cursor)) {
+    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture, display_cursor.load(std::memory_order_relaxed))) {
       return -1;
     }
     game_refresh_target = make_wgc_activity_admission_target(
@@ -503,7 +503,7 @@ namespace platf::dxgi {
 
     // Create session
     _ipc_session = std::make_unique<ipc_session_t>();
-    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture, display_cursor)) {
+    if (_ipc_session->init(config, display_name, device.get(), advanced_color_capture, display_cursor.load(std::memory_order_relaxed))) {
       return -1;
     }
     game_refresh_target = make_wgc_activity_admission_target(

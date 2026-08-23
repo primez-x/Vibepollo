@@ -1722,7 +1722,7 @@ namespace video {
     platf::capture_e capture(
       const push_captured_image_cb_t &push,
       const pull_free_image_cb_t &pull,
-      bool * /*cursor*/
+      const std::atomic_bool * /*cursor*/
     ) override {
       const auto cadence = std::chrono::milliseconds(1000 / std::max(1, client_frame_rate));
       for (;;) {
@@ -1764,7 +1764,7 @@ namespace video {
     platf::capture_e capture(
       const push_captured_image_cb_t &,
       const pull_free_image_cb_t &,
-      bool *
+      const std::atomic_bool *
     ) override { return platf::capture_e::error; }
 
     std::optional<platf::adapter_id_t> capture_adapter_id() const override {

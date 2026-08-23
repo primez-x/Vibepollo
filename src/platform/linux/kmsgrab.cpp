@@ -1192,7 +1192,7 @@ namespace platf {
         return 0;
       }
 
-      capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+      capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, const std::atomic_bool *cursor) override {
         auto next_frame = std::chrono::steady_clock::now();
 
         sleep_overshoot_logger.reset();
@@ -1212,7 +1212,7 @@ namespace platf {
           }
 
           std::shared_ptr<platf::img_t> img_out;
-          auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor);
+          auto status = snapshot(pull_free_image_cb, img_out, 1000ms, cursor->load(std::memory_order_relaxed));
           switch (status) {
             case platf::capture_e::reinit:
             case platf::capture_e::error:
@@ -1413,7 +1413,7 @@ namespace platf {
         return 0;
       }
 
-      capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) {
+      capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, const std::atomic_bool *cursor) {
         auto next_frame = std::chrono::steady_clock::now();
 
         sleep_overshoot_logger.reset();
@@ -1433,7 +1433,7 @@ namespace platf {
           }
 
           std::shared_ptr<platf::img_t> img_out;
-          auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor);
+          auto status = snapshot(pull_free_image_cb, img_out, 1000ms, cursor->load(std::memory_order_relaxed));
           switch (status) {
             case platf::capture_e::reinit:
             case platf::capture_e::error:

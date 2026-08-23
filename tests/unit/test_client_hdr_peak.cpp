@@ -45,3 +45,36 @@ TEST(ClientHdrPeak, ClampsReportedValuesToHostRange) {
   ASSERT_TRUE(high.has_value());
   EXPECT_EQ(high->peak_nits, client_hdr_peak::maximum_host_nits);
 }
+
+TEST(ClientHdrPeak, AutomaticRequestPreservesClientPolicy) {
+  const auto result = client_hdr_peak::resolve_effective_request(
+    false,
+    true,
+    client_hdr_peak::request_override_e::automatic
+  );
+  EXPECT_FALSE(result.hdr_requested);
+  EXPECT_TRUE(result.prefer_sdr_10bit);
+  EXPECT_FALSE(result.force_sdr);
+}
+
+TEST(ClientHdrPeak, ForceOnOverridesTenBitSdrPreference) {
+  const auto result = client_hdr_peak::resolve_effective_request(
+    false,
+    true,
+    client_hdr_peak::request_override_e::force_on
+  );
+  EXPECT_TRUE(result.hdr_requested);
+  EXPECT_FALSE(result.prefer_sdr_10bit);
+  EXPECT_FALSE(result.force_sdr);
+}
+
+TEST(ClientHdrPeak, ForceOffDisablesHdrWithoutDiscardingTenBitSdrPreference) {
+  const auto result = client_hdr_peak::resolve_effective_request(
+    true,
+    true,
+    client_hdr_peak::request_override_e::force_off
+  );
+  EXPECT_FALSE(result.hdr_requested);
+  EXPECT_TRUE(result.prefer_sdr_10bit);
+  EXPECT_TRUE(result.force_sdr);
+}

@@ -215,7 +215,7 @@ namespace platf::dxgi {
       const std::optional<LUID> &required_adapter_luid = std::nullopt
     );
 
-    capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override;
+    capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, const std::atomic_bool *cursor) override;
     void prepare_for_reinit() override;
     std::optional<adapter_id_t> capture_adapter_id() const override;
     output_refresh_e refresh_output_after_nonstructural_change();

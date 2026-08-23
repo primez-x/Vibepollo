@@ -810,7 +810,7 @@ namespace pipewire {
       return false;  // Return to default stream dead handling.
     }
 
-    platf::capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
+    platf::capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, const std::atomic_bool *cursor) override {
       auto next_frame = std::chrono::steady_clock::now();
 
       if (pipewire.ensure_stream(mem_type, width, height, framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia) < 0) {
@@ -844,7 +844,7 @@ namespace pipewire {
         }
 
         std::shared_ptr<platf::img_t> img_out;
-        switch (const auto status = snapshot(pull_free_image_cb, img_out, 1000ms, *cursor)) {
+        switch (const auto status = snapshot(pull_free_image_cb, img_out, 1000ms, cursor->load(std::memory_order_relaxed))) {
           case platf::capture_e::reinit:
           case platf::capture_e::error:
           case platf::capture_e::interrupted:

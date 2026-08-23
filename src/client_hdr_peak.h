@@ -19,6 +19,18 @@ namespace client_hdr_peak {
     display_reported,
   };
 
+  enum class request_override_e {
+    automatic,
+    force_on,
+    force_off,
+  };
+
+  struct effective_request_t {
+    bool hdr_requested {};
+    bool prefer_sdr_10bit {};
+    bool force_sdr {};
+  };
+
   struct result_t {
     std::uint32_t peak_nits {};
     source_e source {source_e::display_reported};
@@ -28,5 +40,10 @@ namespace client_hdr_peak {
   std::optional<result_t> resolve(
     std::string_view calibrated_value,
     std::string_view display_reported_value
+  );
+  effective_request_t resolve_effective_request(
+    bool client_hdr_requested,
+    bool client_prefer_sdr_10bit,
+    request_override_e request_override
   );
 }  // namespace client_hdr_peak

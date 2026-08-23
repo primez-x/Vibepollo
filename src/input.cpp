@@ -330,7 +330,7 @@ namespace input {
 
     switch (keyCode) {
       case 0x4E /* VKEY_N */:
-        display_cursor = !display_cursor;
+        cursor_policy::toggle(display_cursor);
         return 1;
     }
 
