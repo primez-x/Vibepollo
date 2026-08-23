@@ -14,12 +14,13 @@ namespace audio::lifecycle {
   constexpr release_action_e final_owner_release_action(
     const bool restore_sink,
     const bool app_active,
+    const bool app_trackable,
     const bool app_termination_requested
   ) {
     if (!restore_sink) {
       return release_action_e::ignore;
     }
-    if (app_active && !app_termination_requested) {
+    if (app_active && app_trackable && !app_termination_requested) {
       return release_action_e::retain;
     }
     return release_action_e::restore;
@@ -28,8 +29,9 @@ namespace audio::lifecycle {
   constexpr bool can_reclaim_retained_audio(
     const bool retained,
     const bool app_active,
+    const bool app_trackable,
     const bool app_termination_requested
   ) {
-    return retained && app_active && !app_termination_requested;
+    return retained && app_active && app_trackable && !app_termination_requested;
   }
 }  // namespace audio::lifecycle
