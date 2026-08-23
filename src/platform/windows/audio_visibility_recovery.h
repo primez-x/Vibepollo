@@ -76,4 +76,29 @@ namespace platf::audio::visibility_recovery {
     }
     return heal_action_e::reshow_endpoint;
   }
+
+  constexpr bool is_registered_steam_speaker_candidate(
+    const bool endpoint_active,
+    const bool endpoint_name_matches,
+    const bool interface_name_matches
+  ) {
+    return endpoint_active && endpoint_name_matches && interface_name_matches;
+  }
+
+  constexpr bool should_refresh_policy_client(
+    const bool driver_already_current,
+    const bool visibility_restored,
+    const bool endpoint_active
+  ) {
+    return driver_already_current && visibility_restored && !endpoint_active;
+  }
+
+  constexpr bool should_recover_existing_steam_endpoint(
+    const bool driver_already_current,
+    const bool endpoint_found,
+    const bool visibility_restored,
+    const bool endpoint_active
+  ) {
+    return driver_already_current && endpoint_found && visibility_restored && endpoint_active;
+  }
 }  // namespace platf::audio::visibility_recovery

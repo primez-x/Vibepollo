@@ -57,6 +57,7 @@ namespace audio {
     if (lifecycle::final_owner_release_action(
           ctx.restore_sink,
           proc::proc.current_app_id() > 0,
+          proc::proc.has_trackable_running_app(),
           audio_state.terminal_pending()
         ) != lifecycle::release_action_e::retain) {
       return false;
@@ -67,7 +68,7 @@ namespace audio {
       std::move(ctx.sink),
       ctx.restore_sink,
     };
-    if (audio_state.retain(value, proc::proc.current_app_id() > 0)) {
+    if (audio_state.retain(value, proc::proc.current_app_id() > 0 && proc::proc.has_trackable_running_app())) {
       return true;
     }
 
@@ -81,13 +82,14 @@ namespace audio {
     if (lifecycle::can_reclaim_retained_audio(
           true,
           proc::proc.current_app_id() > 0,
+          proc::proc.has_trackable_running_app(),
           audio_state.terminal_pending()
         ) == false) {
       return false;
     }
 
     retained_audio_t value;
-    if (!audio_state.reclaim(value, proc::proc.current_app_id() > 0)) {
+    if (!audio_state.reclaim(value, proc::proc.current_app_id() > 0 && proc::proc.has_trackable_running_app())) {
       return false;
     }
 
@@ -480,6 +482,7 @@ namespace audio {
 #else
     const auto release_action = lifecycle::final_owner_release_action(
       ctx.restore_sink,
+      false,
       false,
       false
     );

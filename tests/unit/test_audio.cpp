@@ -94,25 +94,34 @@ TEST(AudioLifecycleState, ContinuousHandoffHasNoIntermediateRestore) {
 TEST(AudioLifecyclePolicy, RetainsFinalOwnerForResumableApp) {
   using audio::lifecycle::release_action_e;
   EXPECT_EQ(
-    audio::lifecycle::final_owner_release_action(true, true, false),
+    audio::lifecycle::final_owner_release_action(true, true, true, false),
     release_action_e::retain
   );
   EXPECT_EQ(
-    audio::lifecycle::final_owner_release_action(true, true, true),
+    audio::lifecycle::final_owner_release_action(true, true, true, true),
     release_action_e::restore
   );
-  EXPECT_TRUE(audio::lifecycle::can_reclaim_retained_audio(true, true, false));
-  EXPECT_FALSE(audio::lifecycle::can_reclaim_retained_audio(true, false, false));
+  EXPECT_TRUE(audio::lifecycle::can_reclaim_retained_audio(true, true, true, false));
+  EXPECT_FALSE(audio::lifecycle::can_reclaim_retained_audio(true, false, true, false));
+}
+
+TEST(AudioLifecyclePolicy, RestoresUntrackableDetachedApp) {
+  using audio::lifecycle::release_action_e;
+  EXPECT_EQ(
+    audio::lifecycle::final_owner_release_action(true, true, false, false),
+    release_action_e::restore
+  );
+  EXPECT_FALSE(audio::lifecycle::can_reclaim_retained_audio(true, true, false, false));
 }
 
 TEST(AudioLifecyclePolicy, RestoresTerminalAndIgnoresUnchangedSink) {
   using audio::lifecycle::release_action_e;
   EXPECT_EQ(
-    audio::lifecycle::final_owner_release_action(true, false, false),
+    audio::lifecycle::final_owner_release_action(true, false, false, false),
     release_action_e::restore
   );
   EXPECT_EQ(
-    audio::lifecycle::final_owner_release_action(false, true, false),
+    audio::lifecycle::final_owner_release_action(false, true, true, false),
     release_action_e::ignore
   );
 }
